@@ -1,6 +1,7 @@
 .{
     .name = .zig_objc,
     .version = "0.0.0",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0x8a91772ba7d2bf22,
     .paths = .{
         "src/",
@@ -9,5 +10,10 @@
         "README.md",
         "LICENSE",
     },
-    .dependencies = .{},
+    .dependencies = .{
+        .translate_c = .{
+            .url = "git+https://github.com/cataggar/translate-c#62d06a5d3e93c82727544e8113e4762a315ca0ed",
+            .hash = "translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN",
+        },
+    },
 }

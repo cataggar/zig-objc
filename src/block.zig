@@ -2,6 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const objc = @import("main.zig");
+const block_type = @import("block_type.zig");
 
 // We have to use the raw C allocator for all heap allocation in here
 // because the objc runtime expects `malloc` to be used. If you don't use
@@ -86,8 +87,8 @@ pub fn Block(
             };
             ctx.invoke = @ptrCast(func);
             ctx.descriptor = &descriptor;
-            inline for (captures_info.fields) |field| {
-                @field(ctx, field.name) = @field(captures, field.name);
+            inline for (captures_info.field_names) |name| {
+                @field(ctx, name) = @field(captures, name);
             }
 
             return ctx;
@@ -123,11 +124,11 @@ pub fn Block(
         fn descCopyHelper(dst: *anyopaque, src: *anyopaque) callconv(.c) void {
             const real_dst: *Context = @ptrCast(@alignCast(dst));
             const real_src: *Context = @ptrCast(@alignCast(src));
-            inline for (captures_info.fields) |field| {
-                if (field.type == objc.c.id) {
+            inline for (captures_info.field_names, captures_info.field_types) |name, T| {
+                if (T == objc.c.id) {
                     _Block_object_assign(
-                        @ptrCast(&@field(real_dst, field.name)),
-                        @field(real_src, field.name),
+                        @ptrCast(&@field(real_dst, name)),
+                        @field(real_src, name),
                         .object,
                     );
                 }
@@ -136,10 +137,10 @@ pub fn Block(
 
         fn descDisposeHelper(src: *anyopaque) callconv(.c) void {
             const real_src: *Context = @ptrCast(@alignCast(src));
-            inline for (captures_info.fields) |field| {
-                if (field.type == objc.c.id) {
+            inline for (captures_info.field_names, captures_info.field_types) |name, T| {
+                if (T == objc.c.id) {
                     _Block_object_dispose(
-                        @field(real_src, field.name),
+                        @field(real_src, name),
                         .object,
                     );
                 }
@@ -150,11 +151,7 @@ pub fn Block(
         /// the first arg. The first arg is a pointer so from an ABI perspective
         /// this is always the same and can be safely casted.
         fn FnType(comptime ContextArg: type) type {
-            var param_types: [Args.len + 1]type = undefined;
-            param_types[0] = *const ContextArg;
-            for (Args, 1..) |Arg, i| param_types[i] = Arg;
-
-            return @Fn(&param_types, &@splat(.{}), Return, .{ .@"callconv" = .c });
+            return block_type.function(ContextArg, Args, Return);
         }
     };
 }
@@ -162,63 +159,7 @@ pub fn Block(
 /// This is the type of a block structure that is passed as the first
 /// argument to any block invocation. See Block.
 fn BlockContext(comptime Captures: type, comptime InvokeFn: type) type {
-    const captures_info = @typeInfo(Captures).@"struct";
-    var fields: [captures_info.fields.len + 5]std.builtin.Type.StructField = undefined;
-    fields[0] = .{
-        .name = "isa",
-        .type = ?*anyopaque,
-        .default_value_ptr = null,
-        .is_comptime = false,
-        .alignment = @alignOf(*anyopaque),
-    };
-    fields[1] = .{
-        .name = "flags",
-        .type = BlockFlags,
-        .default_value_ptr = null,
-        .is_comptime = false,
-        .alignment = @alignOf(c_int),
-    };
-    fields[2] = .{
-        .name = "reserved",
-        .type = c_int,
-        .default_value_ptr = null,
-        .is_comptime = false,
-        .alignment = @alignOf(c_int),
-    };
-    fields[3] = .{
-        .name = "invoke",
-        .type = *const InvokeFn,
-        .default_value_ptr = null,
-        .is_comptime = false,
-        .alignment = @typeInfo(*const InvokeFn).pointer.alignment,
-    };
-    fields[4] = .{
-        .name = "descriptor",
-        .type = *const Descriptor,
-        .default_value_ptr = null,
-        .is_comptime = false,
-        .alignment = @alignOf(*Descriptor),
-    };
-
-    for (captures_info.fields, 5..) |capture, i| {
-        switch (capture.type) {
-            comptime_int => @compileError("capture should not be a comptime_int, try using @as"),
-            comptime_float => @compileError("capture should not be a comptime_float, try using @as"),
-            else => {},
-        }
-        fields[i] = .{ .name = capture.name, .type = capture.type, .default_value_ptr = null, .is_comptime = false, .alignment = capture.alignment };
-    }
-
-    var field_names: [fields.len][]const u8 = undefined;
-    var field_types: [fields.len]type = undefined;
-    var field_attrs: [fields.len]std.builtin.Type.StructField.Attributes = undefined;
-    for (fields, 0..) |field, i| {
-        field_names[i] = field.name;
-        field_types[i] = field.type;
-        field_attrs[i] = .{ .@"align" = field.alignment };
-    }
-
-    return @Struct(.@"extern", null, &field_names, &field_types, &field_attrs);
+    return block_type.context(Captures, InvokeFn, BlockFlags, Descriptor);
 }
 
 // Pointer to opaque instead of anyopaque: https://github.com/ziglang/zig/issues/18461

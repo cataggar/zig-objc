@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) !void {
     tests.root_module.linkSystemLibrary("objc", .{});
     tests.root_module.linkFramework("Foundation", .{});
     tests.root_module.linkFramework("AppKit", .{}); // Required by 'tagged pointer' test.
-    try addAppleSDK(b, tests.root_module);
+    if (add_paths) try addAppleSDK(b, tests.root_module);
     b.installArtifact(tests);
 
     const test_step = b.step("test", "Run tests");
@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) !void {
 /// Returns a translated Objective-C header module built from the Apple SDK.
 ///
 /// This patches the single `objc/runtime.h` declaration that currently breaks
-/// Zig 0.16 `translate-c`, then translates `objc/runtime.h` and
+/// the C translator, then translates `objc/runtime.h` and
 /// `objc/message.h` into an importable Zig module. Bug report:
 /// https://codeberg.org/ziglang/zig/issues/31917
 fn translateCModule(
@@ -59,14 +59,10 @@ fn translateCModule(
     const sdk_path = try appleSDKPath(b, target);
     const include_path = b.pathJoin(&.{ sdk_path, "/usr/include" });
     const runtime_path = b.pathJoin(&.{ include_path, "/objc/runtime.h" });
-    const runtime_h = try std.Io.Dir.cwd().readFileAlloc(
-        b.graph.io,
-        runtime_path,
-        b.allocator,
-        .limited(1024 * 1024),
-    );
+    b.dependOnFileContents(.{ .cwd_relative = runtime_path });
+    const runtime_h = try std.Io.Dir.cwd().readFileAlloc(b.graph.io, runtime_path, b.allocator, .limited(1024 * 1024));
 
-    // Zig 0.16's translate-c cannot parse Clang block declarators (`^`) in
+    // The C translator cannot parse Clang block declarators (`^`) in
     // objc/runtime.h. Patch just the offending declaration so we still
     // translate the real Apple headers rather than maintaining a local shim.
     const needle =
@@ -99,8 +95,9 @@ fn translateCModule(
         \\
     );
 
-    const c = b.addTranslateC(.{
-        .root_source_file = import_h,
+    const c: @import("translate_c").Translator = .init(b.dependency("translate_c", .{}), .{
+        .name = "objc-c",
+        .c_source_file = import_h,
         .target = target,
         .optimize = optimize,
     });
@@ -108,7 +105,7 @@ fn translateCModule(
     // patched copy, while every other include still falls through to the SDK.
     c.addIncludePath(wf.getDirectory());
     c.addSystemIncludePath(.{ .cwd_relative = include_path });
-    return c.createModule();
+    return c.mod;
 }
 
 /// Add the SDK framework, include, and library paths to the given module.
@@ -125,6 +122,7 @@ pub fn addAppleSDK(b: *std.Build, m: *std.Build.Module) !void {
 }
 
 fn appleSDKPath(b: *std.Build, target: std.Build.ResolvedTarget) ![]const u8 {
+    if (b.option([]const u8, "apple-sdk", "Explicit target Apple SDK path (for cross compilation)")) |path| return path;
     // The cache. This always uses b.allocator and never frees memory
     // (which is idiomatic for a Zig build exe).
     const Cache = struct {
@@ -146,6 +144,7 @@ fn appleSDKPath(b: *std.Build, target: std.Build.ResolvedTarget) ![]const u8 {
     // This executes `xcrun` to get the SDK path. We don't want to execute
     // this multiple times so we cache the value.
     if (!gop.found_existing) {
+        b.graph.poisonCache();
         gop.value_ptr.* = std.zig.system.darwin.getSdk(
             b.allocator,
             b.graph.io,
