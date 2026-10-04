@@ -76,7 +76,7 @@ const NSOperatingSystemVersion = extern struct {
 Add this repository to your `build.zig.zon` file. Then:
 
 ```zig
-pub fn build(b: *std.build.Builder) !void {
+pub fn build(b: *std.Build) !void {
   // ... other stuff
 
   exe.root_module.addImport("objc", b.dependency("zig_objc", .{
@@ -93,6 +93,27 @@ Xcode is not installed, you can add it manually but you must set the
 
 **`zig-objc` only works with released versions of Zig.** We don't support
 nightly versions because the Zig compiler is still changing too much.
+
+This compatibility branch requires Zig 0.17.0 (macOS 15+). C translation uses
+the exact pinned `cataggar/translate-c` 2.0.0 and GitHub Aro mirror, preserving
+the runtime-header block-declarator workaround. Native `zig build test -j2`
+requires Xcode. Cross-builds may supply `-Dapple-sdk=/path/to/MacOSX.sdk`; the
+same SDK supplies translated headers and module/framework/library paths.
+With `-Dadd-paths=false`, consumers remain responsible for their own link paths.
+
+The development shell installs the SHA-256-pinned `cataggar/zig` 0.17 release,
+not a nightly or an overlay's latest version. Block context/function synthesis
+can be validated without Apple headers or a runtime:
+
+```sh
+zig test src/block_type.zig
+zig test src/block_type.zig -target aarch64-macos -fno-emit-bin
+zig test src/block_type.zig -target x86_64-macos -fno-emit-bin
+```
+
+These checks cover capture alignment and C invocation types, not native block
+copy/dispose, message dispatch, or Apple SDK translation. Run the full native
+suite before accepting those integration paths.
 
 ## Documentation
 
