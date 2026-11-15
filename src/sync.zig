@@ -13,7 +13,7 @@ pub const SyncError = error{
     Unexpected,
 };
 
-fn checkStatus(status: c_int) SyncError!void {
+inline fn checkStatus(status: c_int) SyncError!void {
     return switch (status) {
         c.OBJC_SYNC_SUCCESS => {},
         c.OBJC_SYNC_NOT_OWNING_THREAD_ERROR => error.NotOwningThread,
@@ -25,14 +25,14 @@ fn checkStatus(status: c_int) SyncError!void {
 /// Allocates a recursive mutex associated with `obj` if needed and blocks
 /// until the current thread acquires it. Passing a nil `Object` is a no-op
 /// that succeeds.
-pub fn syncEnter(obj: objc.Object) SyncError!void {
+pub inline fn syncEnter(obj: objc.Object) SyncError!void {
     return checkStatus(c.objc_sync_enter(obj.value));
 }
 
 /// Ends synchronizing on `obj` (`objc_sync_exit`).
 /// Returns `error.NotOwningThread` if the calling thread does not hold the
 /// lock for `obj`. Passing a nil `Object` is a no-op that succeeds.
-pub fn syncExit(obj: objc.Object) SyncError!void {
+pub inline fn syncExit(obj: objc.Object) SyncError!void {
     return checkStatus(c.objc_sync_exit(obj.value));
 }
 
@@ -43,19 +43,19 @@ pub const SyncGuard = struct {
 
     /// Releases the synchronization lock, asserting that the current thread
     /// still owns it. Suitable for `defer guard.unlock()`.
-    pub fn unlock(self: SyncGuard) void {
+    pub inline fn unlock(self: SyncGuard) void {
         syncExit(self.obj) catch unreachable;
     }
 
     /// Releases the synchronization lock, returning any runtime `SyncError`.
-    pub fn tryUnlock(self: SyncGuard) SyncError!void {
+    pub inline fn tryUnlock(self: SyncGuard) SyncError!void {
         return syncExit(self.obj);
     }
 };
 
 /// Acquires the recursive synchronization monitor for `obj` and returns a
 /// `SyncGuard` whose `unlock()` releases the monitor.
-pub fn synchronize(obj: objc.Object) SyncError!SyncGuard {
+pub inline fn synchronize(obj: objc.Object) SyncError!SyncGuard {
     try syncEnter(obj);
     return .{ .obj = obj };
 }

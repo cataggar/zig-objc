@@ -12,19 +12,22 @@ pub const Protocol = extern struct {
     value: *c.Protocol,
 
     /// Returns true if two `Protocol` handles refer to the same protocol (`protocol_isEqual`).
-    pub fn eql(self: Protocol, other: Protocol) bool {
+    pub inline fn eql(self: Protocol, other: Protocol) bool {
         return boolResult(c.protocol_isEqual(self.value, other.value));
     }
 
     pub const isEqual = eql;
 
     /// Returns the name of this protocol (`protocol_getName`).
-    pub fn getName(self: Protocol) [:0]const u8 {
-        return std.mem.span(c.protocol_getName(self.value));
+    pub inline fn getName(self: Protocol) [:0]const u8 {
+        const raw = c.protocol_getName(self.value);
+        if (raw == null) return "";
+        const ptr: [*:0]const u8 = @ptrCast(raw);
+        return std.mem.span(ptr);
     }
 
     /// Returns true if `self` conforms to `other` (`protocol_conformsToProtocol`).
-    pub fn conformsToProtocol(self: Protocol, other: Protocol) bool {
+    pub inline fn conformsToProtocol(self: Protocol, other: Protocol) bool {
         return boolResult(c.protocol_conformsToProtocol(self.value, other.value));
     }
 
@@ -162,7 +165,7 @@ pub const Protocol = extern struct {
     }
 
     /// Convenience wrapper around `addMethodDescription` that computes the Objective-C
-    /// method encoding at comptime from `Fn` (`fn (receiver, c.SEL, ...) ...`).
+    /// method encoding at comptime from `Fn` (`fn (receiver, objc.Sel / c.SEL, ...) callconv(.c) ...`).
     pub fn addMethod(
         self: Protocol,
         sel: anytype,
@@ -178,17 +181,8 @@ pub const Protocol = extern struct {
                 @compileError("Protocol.addMethod expected a function or function pointer type, got " ++ @typeName(Fn)),
             else => @compileError("Protocol.addMethod expected a function or function pointer type, got " ++ @typeName(Fn)),
         };
-        const fn_info = @typeInfo(RealFn).@"fn";
-        assert(fn_info.attrs.varargs == false);
-        assert(fn_info.param_types.len >= 2);
-        const CConvFn = comptime if (std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c))
-            RealFn
-        else blk: {
-            var params: [fn_info.param_types.len]type = undefined;
-            for (fn_info.param_types, 0..) |pt, i| params[i] = pt.?;
-            break :blk @Fn(&params, &@splat(.{}), fn_info.return_type.?, .{ .@"callconv" = .c });
-        };
-        const types = comptime objc.comptimeEncode(CConvFn);
+        comptime validateProtocolMethodFn(RealFn);
+        const types = comptime objc.comptimeEncode(RealFn);
         self.addMethodDescription(sel, &types, is_required_method, is_instance_method);
     }
 
@@ -223,7 +217,39 @@ pub const Protocol = extern struct {
     }
 };
 
-fn resolveSel(sel_or_name: anytype) objc.Sel {
+fn validateProtocolMethodFn(comptime Fn: type) void {
+    if (@typeInfo(Fn) != .@"fn") {
+        @compileError("Protocol method must be a function type, got " ++ @typeName(Fn));
+    }
+    const fn_info = @typeInfo(Fn).@"fn";
+    if (!std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c)) {
+        @compileError("Objective-C protocol method function must use callconv(.c): " ++ @typeName(Fn));
+    }
+    if (fn_info.attrs.varargs) {
+        @compileError("Protocol.addMethod comptime encoding does not support varargs signatures directly; use addMethodDescription");
+    }
+    if (fn_info.param_types.len < 2) {
+        @compileError("Objective-C protocol method function must accept at least (receiver, SEL) parameters");
+    }
+    const Receiver = fn_info.param_types[0] orelse
+        @compileError("Objective-C protocol method receiver parameter (index 0) cannot be generic (`anytype`): " ++ @typeName(Fn));
+    const valid_receiver = (Receiver == c.id or
+        Receiver == objc.Object or
+        Receiver == c.Class or
+        Receiver == objc.Class or
+        Receiver == ?*anyopaque or
+        Receiver == *anyopaque);
+    if (!valid_receiver) {
+        @compileError("Objective-C protocol method first parameter (receiver) must be objc.Object, c.id, objc.Class, c.Class, ?*anyopaque, or *anyopaque, got " ++ @typeName(Receiver));
+    }
+    const Selector = fn_info.param_types[1] orelse
+        @compileError("Objective-C protocol method selector parameter (index 1) cannot be generic (`anytype`): " ++ @typeName(Fn));
+    if (Selector != c.SEL and Selector != objc.Sel) {
+        @compileError("Objective-C protocol method second parameter (_cmd) must be objc.Sel or c.SEL, got " ++ @typeName(Selector));
+    }
+}
+
+inline fn resolveSel(sel_or_name: anytype) objc.Sel {
     return switch (@TypeOf(sel_or_name)) {
         objc.Sel => sel_or_name,
         c.SEL => .{ .value = sel_or_name },
