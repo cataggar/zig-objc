@@ -317,7 +317,7 @@ test "subClass" {
             return target;
         }
     };
-    Subclass.replaceMethod("init", str.inner);
+    _ = Subclass.replaceMethod("init", str.inner);
     objc.registerClassPair(Subclass);
     const subclass_obj = Subclass.msgSend(objc.Object, "alloc", .{});
     defer subclass_obj.msgSend(void, "dealloc", .{});

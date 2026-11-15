@@ -1101,7 +1101,7 @@ test "Block captures objc.Object and nested blocks with retain and dispose lifec
             return 77;
         }
     };
-    TrackerCls.replaceMethod("dealloc", tracker_impl.dealloc);
+    _ = TrackerCls.replaceMethod("dealloc", tracker_impl.dealloc);
     try std.testing.expect(TrackerCls.addMethod("magic", tracker_impl.magic));
     objc.registerClassPair(TrackerCls);
 

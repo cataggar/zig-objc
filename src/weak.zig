@@ -185,7 +185,7 @@ test "Weak copyFrom, moveFrom, store, loadAutoreleased, and deinit" {
     const Tracked = objc.allocateClassPair(NSObject, "ZigObjcWeakTrackedObject").?;
     defer objc.disposeClassPair(Tracked);
 
-    Tracked.replaceMethod("dealloc", struct {
+    _ = Tracked.replaceMethod("dealloc", struct {
         fn dealloc(target: c.id, _: c.SEL) callconv(.c) void {
             State.dealloc_count += 1;
             const self = objc.Object.fromId(target);

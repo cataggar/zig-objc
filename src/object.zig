@@ -633,7 +633,7 @@ test "associated objects" {
 
     const Tracked = objc.allocateClassPair(NSObject, "ZigObjcAssocTracked").?;
     defer objc.disposeClassPair(Tracked);
-    Tracked.replaceMethod("dealloc", struct {
+    _ = Tracked.replaceMethod("dealloc", struct {
         fn dealloc(target: c.id, _: c.SEL) callconv(.c) void {
             Keys.dealloc_count += 1;
             Object.fromId(target).msgSendSuper(objc.getClass("NSObject").?, void, "dealloc", .{});
@@ -694,13 +694,13 @@ test "alloc, allocInit, autorelease, ARC helpers, and storeStrong" {
 
     const Tracked = objc.allocateClassPair(NSObject, "ZigObjcLifecycleTracked").?;
     defer objc.disposeClassPair(Tracked);
-    Tracked.replaceMethod("init", struct {
+    _ = Tracked.replaceMethod("init", struct {
         fn init(target: c.id, _: c.SEL) callconv(.c) c.id {
             Stats.init_count += 1;
             return Object.fromId(target).msgSendSuper(objc.getClass("NSObject").?, Object, "init", .{}).value;
         }
     }.init);
-    Tracked.replaceMethod("dealloc", struct {
+    _ = Tracked.replaceMethod("dealloc", struct {
         fn dealloc(target: c.id, _: c.SEL) callconv(.c) void {
             Stats.dealloc_count += 1;
             Object.fromId(target).msgSendSuper(objc.getClass("NSObject").?, void, "dealloc", .{});

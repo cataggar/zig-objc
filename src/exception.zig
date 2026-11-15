@@ -367,7 +367,7 @@ test "tryCall and tracked +1 retain ownership across autorelease pool drain" {
     };
 
     Tracker.dealloc_count = 0;
-    Tracked.replaceMethod("dealloc", Tracker.dealloc);
+    _ = Tracked.replaceMethod("dealloc", Tracker.dealloc);
     objc.registerClassPair(Tracked);
 
     var out_val: usize = 0;
