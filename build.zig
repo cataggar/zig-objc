@@ -8,6 +8,11 @@ pub fn build(b: *std.Build) !void {
         "add-paths",
         "add apple SDK paths from Xcode installation",
     ) orelse true;
+    const test_file = b.option(
+        []const u8,
+        "test-file",
+        "override root source file for unit tests",
+    ) orelse "src/main.zig";
 
     // Translate the Objective-C runtime headers once in the build so the Zig
     // code can import a stable generated module instead of invoking @cImport
@@ -19,25 +24,19 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
-    objc.addImport("objc-c", objc_c);
-    if (add_paths) try addAppleSDK(b, objc);
-    objc.linkSystemLibrary("objc", .{});
-    objc.linkFramework("Foundation", .{});
+    try configureModule(b, objc, objc_c, add_paths);
 
     const tests_root = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path(test_file),
         .target = target,
         .optimize = optimize,
     });
-    tests_root.addImport("objc-c", objc_c);
+    try configureModule(b, tests_root, objc_c, add_paths);
     const tests = b.addTest(.{
         .name = "objc-test",
         .root_module = tests_root,
     });
-    tests.root_module.linkSystemLibrary("objc", .{});
-    tests.root_module.linkFramework("Foundation", .{});
     tests.root_module.linkFramework("AppKit", .{}); // Required by 'tagged pointer' test.
-    if (add_paths) try addAppleSDK(b, tests.root_module);
     b.installArtifact(tests);
 
     const test_step = b.step("test", "Run tests");
@@ -45,11 +44,28 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&tests_run.step);
 }
 
+fn configureModule(
+    b: *std.Build,
+    m: *std.Build.Module,
+    objc_c: *std.Build.Module,
+    add_paths: bool,
+) !void {
+    m.link_libc = true;
+    m.addImport("objc-c", objc_c);
+    if (add_paths) try addAppleSDK(b, m);
+    m.addCSourceFile(.{
+        .file = b.path("src/exception_shim.m"),
+        .flags = &.{ "-x", "objective-c", "-fobjc-exceptions", "-fno-objc-arc" },
+    });
+    m.linkSystemLibrary("objc", .{});
+    m.linkFramework("Foundation", .{});
+}
+
 /// Returns a translated Objective-C header module built from the Apple SDK.
 ///
 /// This patches the single `objc/runtime.h` declaration that currently breaks
-/// the C translator, then translates `objc/runtime.h` and
-/// `objc/message.h` into an importable Zig module. Bug report:
+/// the C translator, then translates the modern Objective-C runtime headers
+/// into an importable Zig module. Bug report:
 /// https://codeberg.org/ziglang/zig/issues/31917
 fn translateCModule(
     b: *std.Build,
@@ -92,6 +108,11 @@ fn translateCModule(
     const import_h = wf.add("objc-import.h",
         \\#include <objc/runtime.h>
         \\#include <objc/message.h>
+        \\#include <objc/objc.h>
+        \\#include <objc/NSObjCRuntime.h>
+        \\#include <objc/objc-sync.h>
+        \\#include <objc/objc-exception.h>
+        \\#include <Block.h>
         \\
     );
 

@@ -3,17 +3,34 @@ const cpkg = @import("c.zig");
 const c = cpkg.c;
 const boolResult = cpkg.boolResult;
 const objc = @import("main.zig");
+const Ivar = @import("ivar.zig").Ivar;
 const MsgSend = @import("msg_send.zig").MsgSend;
 const Iterator = @import("iterator.zig").Iterator;
+const sync = @import("sync.zig");
+
+/// Memory management policies for Objective-C associated objects (`objc_setAssociatedObject`).
+pub const AssociationPolicy = enum(c.objc_AssociationPolicy) {
+    assign = @intCast(c.OBJC_ASSOCIATION_ASSIGN),
+    retain_nonatomic = @intCast(c.OBJC_ASSOCIATION_RETAIN_NONATOMIC),
+    copy_nonatomic = @intCast(c.OBJC_ASSOCIATION_COPY_NONATOMIC),
+    retain = @intCast(c.OBJC_ASSOCIATION_RETAIN),
+    copy = @intCast(c.OBJC_ASSOCIATION_COPY),
+};
+
+const OuterAssociationPolicy = AssociationPolicy;
 
 /// Object is an instance of a class.
 pub const Object = struct {
     value: c.id,
 
+    pub const AssociationPolicy = OuterAssociationPolicy;
+
     // Implement msgSend
     const msg_send = MsgSend(Object);
     pub const msgSend = msg_send.msgSend;
     pub const msgSendSuper = msg_send.msgSendSuper;
+    pub const msgSendTry = msg_send.msgSendTry;
+    pub const msgSendSuperTry = msg_send.msgSendSuperTry;
 
     /// Convert a raw "id" into an Object. id must fit the size of the
     /// normal C "id" type (i.e. a `usize`).
@@ -35,6 +52,18 @@ pub const Object = struct {
         return .{ .value = ptr };
     }
 
+    /// Allocates an uninitialized instance of `cls` via the fast `objc_alloc` runtime entry point.
+    pub fn alloc(cls: objc.Class) ?Object {
+        const raw = objc_alloc(cls.value);
+        return if (raw == null) null else fromId(raw);
+    }
+
+    /// Allocates and initializes an instance of `cls` (`[[cls alloc] init]`) via `objc_alloc_init`.
+    pub fn allocInit(cls: objc.Class) ?Object {
+        const raw = objc_alloc_init(cls.value);
+        return if (raw == null) null else fromId(raw);
+    }
+
     /// Returns the class of an object.
     pub fn getClass(self: Object) ?objc.Class {
         return objc.Class{
@@ -42,9 +71,21 @@ pub const Object = struct {
         };
     }
 
+    /// Sets the class of an object (`object_setClass`) and returns its previous class.
+    pub fn setClass(self: Object, cls: objc.Class) ?objc.Class {
+        return objc.Class{
+            .value = c.object_setClass(self.value, cls.value) orelse return null,
+        };
+    }
+
     /// Returns the class name of a given object.
     pub fn getClassName(self: Object) [:0]const u8 {
         return std.mem.span(c.object_getClassName(self.value));
+    }
+
+    /// Returns a pointer to any extra bytes allocated with this instance (e.g. via `class_createInstance`).
+    pub fn getIndexedIvars(self: Object) ?*anyopaque {
+        return c.object_getIndexedIvars(self.value);
     }
 
     /// Set a property. This is a helper around getProperty and is
@@ -107,14 +148,151 @@ pub const Object = struct {
         return boolResult(c.object_isClass(self.value));
     }
 
+    /// Reads an Objective-C object instance variable (`object_getIvar`).
+    /// Returns `null` if the ivar is `nil` or `self` is `nil`.
+    pub fn getIvar(self: Object, ivar: Ivar) ?Object {
+        const raw = c.object_getIvar(self.value, ivar.value);
+        return if (raw == null) null else fromId(raw);
+    }
+
+    /// Sets an Objective-C object instance variable (`object_setIvar`).
+    /// Unknown memory management defaults to `unsafe_unretained`.
+    pub fn setIvar(self: Object, ivar: Ivar, value: ?Object) void {
+        c.object_setIvar(self.value, ivar.value, if (value) |v| v.value else null);
+    }
+
+    /// Sets an Objective-C object instance variable (`object_setIvarWithStrongDefault`).
+    /// Unknown memory management defaults to `strong`.
+    pub fn setIvarWithStrongDefault(self: Object, ivar: Ivar, value: ?Object) void {
+        c.object_setIvarWithStrongDefault(self.value, ivar.value, if (value) |v| v.value else null);
+    }
+
     pub fn getInstanceVariable(self: Object, name: [:0]const u8) Object {
-        const ivar = c.object_getInstanceVariable(self.value, name, null);
+        const ivar = c.object_getInstanceVariable(self.value, name.ptr, null) orelse return .{ .value = null };
         return fromId(c.object_getIvar(self.value, ivar));
     }
 
-    pub fn setInstanceVariable(self: Object, name: [:0]const u8, val: Object) void {
-        const ivar = c.object_getInstanceVariable(self.value, name, null);
-        c.object_setIvar(self.value, ivar, val.value);
+    pub fn setInstanceVariable(self: Object, name: [:0]const u8, val: ?Object) void {
+        if (@hasDecl(c, "object_setInstanceVariable")) {
+            _ = c.object_setInstanceVariable(
+                self.value,
+                name.ptr,
+                if (val) |v| @ptrCast(v.value) else null,
+            );
+        } else {
+            const ivar = c.object_getInstanceVariable(self.value, name.ptr, null) orelse return;
+            c.object_setIvar(self.value, ivar, if (val) |v| v.value else null);
+        }
+    }
+
+    /// Sets an Objective-C object instance variable by name, defaulting unknown memory management to `strong`.
+    pub fn setInstanceVariableWithStrongDefault(self: Object, name: [:0]const u8, value: ?Object) void {
+        if (@hasDecl(c, "object_setInstanceVariableWithStrongDefault")) {
+            _ = c.object_setInstanceVariableWithStrongDefault(
+                self.value,
+                name.ptr,
+                if (value) |v| @ptrCast(v.value) else null,
+            );
+        } else {
+            const cls = c.object_getClass(self.value) orelse return;
+            const ivar = c.class_getInstanceVariable(cls, name.ptr) orelse return;
+            c.object_setIvarWithStrongDefault(self.value, ivar, if (value) |v| v.value else null);
+        }
+    }
+
+    /// Returns a direct pointer to a non-object instance variable (`*MyZigState`, `usize`, `f64`, `extern struct`, etc.)
+    /// computed from `ivar.getOffset()`.
+    ///
+    /// Objective-C object ivars (`Object` / `?Object` / `c.id`) must use `getIvar` / `setIvar` instead.
+    pub fn getIvarPtr(self: Object, comptime T: type, ivar: Ivar) *align(1) T {
+        if (T == Object or T == ?Object or T == c.id) {
+            @compileError("Objective-C object ivars must use Object.getIvar / Object.setIvar / Object.setIvarWithStrongDefault instead of direct byte-offset pointers");
+        }
+        std.debug.assert(self.value != null);
+        std.debug.assert(ivar.value != null);
+        const base: [*]u8 = @ptrCast(self.value.?);
+        const offset: usize = @intCast(ivar.getOffset());
+        return @ptrCast(base + offset);
+    }
+
+    /// Reads an instance variable of type `T`, routing `Object`/`?Object`/`c.id` through `object_getIvar`
+    /// and non-object Zig types through `getIvarPtr`.
+    pub fn getIvarValue(self: Object, comptime T: type, ivar: Ivar) T {
+        if (T == ?Object) return self.getIvar(ivar);
+        if (T == Object) return self.getIvar(ivar) orelse .{ .value = null };
+        if (T == c.id) return c.object_getIvar(self.value, ivar.value);
+        return self.getIvarPtr(T, ivar).*;
+    }
+
+    /// Writes an instance variable of type `T`, routing `Object`/`?Object`/`c.id` through `object_setIvar`
+    /// and non-object Zig types through `getIvarPtr`.
+    pub fn setIvarValue(self: Object, comptime T: type, ivar: Ivar, val: T) void {
+        if (T == ?Object) {
+            self.setIvar(ivar, val);
+            return;
+        }
+        if (T == Object) {
+            self.setIvar(ivar, val);
+            return;
+        }
+        if (T == c.id) {
+            c.object_setIvar(self.value, ivar.value, val);
+            return;
+        }
+        self.getIvarPtr(T, ivar).* = val;
+    }
+
+    /// Looks up the instance variable `name` on `self`'s class and reads its typed value.
+    /// Returns `null` if `self` is `nil`, the ivar is not found, or `T == Object` and the ivar holds `nil`.
+    pub fn getTypedIvar(self: Object, comptime T: type, name: [:0]const u8) ?T {
+        const cls = c.object_getClass(self.value) orelse return null;
+        const raw_ivar = c.class_getInstanceVariable(cls, name.ptr) orelse return null;
+        const ivar: Ivar = .{ .value = raw_ivar };
+        if (T == Object) return self.getIvar(ivar);
+        return self.getIvarValue(T, ivar);
+    }
+
+    /// Looks up the instance variable `name` on `self`'s class and writes `val`.
+    /// Returns `false` if `self` is `nil` or no ivar named `name` exists on `self`'s class.
+    pub fn setTypedIvar(self: Object, comptime T: type, name: [:0]const u8, val: T) bool {
+        const cls = c.object_getClass(self.value) orelse return false;
+        const raw_ivar = c.class_getInstanceVariable(cls, name.ptr) orelse return false;
+        self.setIvarValue(T, .{ .value = raw_ivar }, val);
+        return true;
+    }
+
+    /// Associates `value` with `self` under pointer identity `key` using `policy` (`objc_setAssociatedObject`).
+    /// Pass `null` for `value` to clear an existing association for `key`.
+    pub fn setAssociatedObject(
+        self: Object,
+        key: *const anyopaque,
+        value: ?Object,
+        policy: OuterAssociationPolicy,
+    ) void {
+        c.objc_setAssociatedObject(
+            self.value,
+            key,
+            if (value) |v| v.value else null,
+            @backingInt(policy),
+        );
+    }
+
+    /// Returns the object associated with `self` for pointer identity `key` (`objc_getAssociatedObject`),
+    /// or `null` if none is set.
+    pub fn getAssociatedObject(self: Object, key: *const anyopaque) ?Object {
+        const raw = c.objc_getAssociatedObject(self.value, key);
+        return if (raw == null) null else fromId(raw);
+    }
+
+    /// Removes all associated objects from `self` (`objc_removeAssociatedObjects`).
+    pub fn removeAssociatedObjects(self: Object) void {
+        c.objc_removeAssociatedObjects(self.value);
+    }
+
+    /// Acquires the recursive `@synchronized` monitor for `self` (`objc_sync_enter`),
+    /// returning a `SyncGuard` whose `unlock()` releases the monitor (`objc_sync_exit`).
+    pub fn synchronize(self: Object) sync.SyncError!sync.SyncGuard {
+        return sync.synchronize(self);
     }
 
     pub fn retain(self: Object) Object {
@@ -125,6 +303,39 @@ pub const Object = struct {
         objc_release(self.value);
     }
 
+    /// Adds `self` to the current `AutoreleasePool` (`objc_autorelease`).
+    pub fn autorelease(self: Object) Object {
+        return fromId(objc_autorelease(self.value));
+    }
+
+    /// Retains `self` and adds it to the current `AutoreleasePool` (`objc_retainAutorelease`).
+    pub fn retainAutorelease(self: Object) Object {
+        return fromId(objc_retainAutorelease(self.value));
+    }
+
+    /// Claims/retains a value returned from an autoreleasing Objective-C call (`objc_retainAutoreleasedReturnValue`).
+    pub fn retainAutoreleasedReturnValue(self: Object) Object {
+        return fromId(objc_retainAutoreleasedReturnValue(self.value));
+    }
+
+    /// Retains `self` and prepares it for ARC autoreleased return handoff (`objc_retainAutoreleaseReturnValue`).
+    pub fn retainAutoreleaseReturnValue(self: Object) Object {
+        return fromId(objc_retainAutoreleaseReturnValue(self.value));
+    }
+
+    /// Claims an autoreleased return value without retaining (`objc_unsafeClaimAutoreleasedReturnValue`).
+    pub fn unsafeClaimAutoreleasedReturnValue(self: Object) Object {
+        return fromId(objc_unsafeClaimAutoreleasedReturnValue(self.value));
+    }
+
+    /// Atomically retains `new_val`, stores it into `slot`, and releases the previous value (`objc_storeStrong`).
+    pub fn storeStrong(slot: *?Object, new_val: ?Object) void {
+        var raw: c.id = if (slot.*) |prev| prev.value else null;
+        const next_raw: c.id = if (new_val) |v| v.value else null;
+        objc_storeStrong(&raw, next_raw);
+        slot.* = if (raw == null) null else fromId(raw);
+    }
+
     /// Return an iterator for this object. The object must implement the
     /// `NSFastEnumeration` protocol.
     pub fn iterate(self: Object) Iterator {
@@ -132,8 +343,20 @@ pub const Object = struct {
     }
 };
 
+pub const alloc = Object.alloc;
+pub const allocInit = Object.allocInit;
+pub const storeStrong = Object.storeStrong;
+
 extern "c" fn objc_retain(objc.c.id) objc.c.id;
 extern "c" fn objc_release(objc.c.id) void;
+extern "c" fn objc_autorelease(objc.c.id) objc.c.id;
+extern "c" fn objc_retainAutorelease(objc.c.id) objc.c.id;
+extern "c" fn objc_retainAutoreleasedReturnValue(objc.c.id) objc.c.id;
+extern "c" fn objc_retainAutoreleaseReturnValue(objc.c.id) objc.c.id;
+extern "c" fn objc_unsafeClaimAutoreleasedReturnValue(objc.c.id) objc.c.id;
+extern "c" fn objc_storeStrong(location: *objc.c.id, obj: objc.c.id) void;
+extern "c" fn objc_alloc(objc.c.Class) objc.c.id;
+extern "c" fn objc_alloc_init(objc.c.Class) objc.c.id;
 
 fn retainCount(obj: Object) c_ulong {
     return obj.msgSend(c_ulong, objc.Sel.registerName("retainCount"), .{});
@@ -236,4 +459,381 @@ test "msgSend with objc wrapper args" {
     // Pass objc.Sel as an argument: -[NSObject respondsToSelector:]
     const responds = obj.msgSend(bool, "respondsToSelector:", .{objc.Sel.registerName("init")});
     try testing.expect(responds);
+}
+
+test {
+    _ = @import("ivar.zig");
+    _ = @import("weak.zig");
+}
+
+test "typed ivars (Zig pointers, integers, structs) and object ivars" {
+    const testing = std.testing;
+    const NSObject = objc.getClass("NSObject").?;
+
+    const MyState = struct {
+        counter: usize,
+        label: []const u8,
+    };
+    const Point = extern struct {
+        x: f64,
+        y: f64,
+    };
+
+    const raw_cls = c.objc_allocateClassPair(NSObject.value, "ZigObjcTypedIvarTestClass", 0) orelse return error.AllocateClassFailed;
+    defer c.objc_disposeClassPair(raw_cls);
+
+    const state_enc = comptime objc.comptimeEncode(*anyopaque);
+    const usize_enc = comptime objc.comptimeEncode(usize);
+    const point_enc = comptime objc.comptimeEncode(Point);
+
+    try testing.expect(boolResult(c.class_addIvar(
+        raw_cls,
+        "state_ptr",
+        @sizeOf(*MyState),
+        std.math.log2_int(u8, @alignOf(*MyState)),
+        &state_enc,
+    )));
+    try testing.expect(boolResult(c.class_addIvar(
+        raw_cls,
+        "count",
+        @sizeOf(usize),
+        std.math.log2_int(u8, @alignOf(usize)),
+        &usize_enc,
+    )));
+    try testing.expect(boolResult(c.class_addIvar(
+        raw_cls,
+        "point",
+        @sizeOf(Point),
+        std.math.log2_int(u8, @alignOf(Point)),
+        &point_enc,
+    )));
+    try testing.expect(boolResult(c.class_addIvar(
+        raw_cls,
+        "child_obj",
+        @sizeOf(c.id),
+        std.math.log2_int(u8, @alignOf(c.id)),
+        "@",
+    )));
+    try testing.expect(boolResult(c.class_addIvar(
+        raw_cls,
+        "strong_obj",
+        @sizeOf(c.id),
+        std.math.log2_int(u8, @alignOf(c.id)),
+        "@",
+    )));
+
+    c.objc_registerClassPair(raw_cls);
+    const cls: objc.Class = .{ .value = raw_cls };
+
+    const inst = Object.allocInit(cls) orelse return error.AllocInitFailed;
+    defer inst.release();
+
+    var state: MyState = .{ .counter = 10, .label = "zig-ivar" };
+
+    const state_ivar: Ivar = .{ .value = c.class_getInstanceVariable(raw_cls, "state_ptr").? };
+    const count_ivar: Ivar = .{ .value = c.class_getInstanceVariable(raw_cls, "count").? };
+    const point_ivar: Ivar = .{ .value = c.class_getInstanceVariable(raw_cls, "point").? };
+    const child_ivar: Ivar = .{ .value = c.class_getInstanceVariable(raw_cls, "child_obj").? };
+    const strong_ivar: Ivar = .{ .value = c.class_getInstanceVariable(raw_cls, "strong_obj").? };
+
+    // Pointer ivar via setIvarValue / getIvarValue / getIvarPtr / getTypedIvar
+    inst.setIvarValue(*MyState, state_ivar, &state);
+    const got_state = inst.getIvarValue(*MyState, state_ivar);
+    try testing.expectEqual(@as(usize, 10), got_state.counter);
+    try testing.expectEqualStrings("zig-ivar", got_state.label);
+    got_state.counter = 42;
+    try testing.expectEqual(@as(usize, 42), state.counter);
+    try testing.expectEqual(&state, inst.getTypedIvar(*MyState, "state_ptr").?);
+
+    // Integer ivar via getIvarPtr and by-name helpers
+    inst.getIvarPtr(usize, count_ivar).* = 9001;
+    try testing.expectEqual(@as(usize, 9001), inst.getIvarValue(usize, count_ivar));
+    try testing.expect(inst.setTypedIvar(usize, "count", 12345));
+    try testing.expectEqual(@as(usize, 12345), inst.getTypedIvar(usize, "count").?);
+
+    // Extern struct ivar
+    try testing.expect(inst.setTypedIvar(Point, "point", .{ .x = 1.5, .y = -3.25 }));
+    const pt = inst.getIvarValue(Point, point_ivar);
+    try testing.expectEqual(Point{ .x = 1.5, .y = -3.25 }, pt);
+
+    // Missing ivar returns null / false
+    try testing.expect(inst.getTypedIvar(usize, "no_such_ivar") == null);
+    try testing.expect(!inst.setTypedIvar(usize, "no_such_ivar", 1));
+
+    // Object ivars: getIvar / setIvar / setIvarWithStrongDefault / setInstanceVariableWithStrongDefault
+    try testing.expect(inst.getIvar(child_ivar) == null);
+    try testing.expect(inst.getTypedIvar(Object, "child_obj") == null);
+
+    const child = Object.allocInit(NSObject).?;
+    defer child.release();
+
+    inst.setIvar(child_ivar, child);
+    try testing.expectEqual(child.value, inst.getIvar(child_ivar).?.value);
+    try testing.expectEqual(child.value, inst.getTypedIvar(Object, "child_obj").?.value);
+    inst.setIvar(child_ivar, null);
+    try testing.expect(inst.getIvar(child_ivar) == null);
+
+    // Strong default retains unknown-ownership dynamic ivars
+    const strong_target = Object.allocInit(NSObject).?;
+    defer strong_target.release();
+    try testing.expectEqual(@as(c_ulong, 1), retainCount(strong_target));
+
+    inst.setIvarWithStrongDefault(strong_ivar, strong_target);
+    try testing.expectEqual(@as(c_ulong, 2), retainCount(strong_target));
+    inst.setIvarWithStrongDefault(strong_ivar, null);
+    try testing.expectEqual(@as(c_ulong, 1), retainCount(strong_target));
+
+    inst.setInstanceVariableWithStrongDefault("strong_obj", strong_target);
+    try testing.expectEqual(@as(c_ulong, 2), retainCount(strong_target));
+    inst.setInstanceVariableWithStrongDefault("strong_obj", null);
+    try testing.expectEqual(@as(c_ulong, 1), retainCount(strong_target));
+}
+
+test "setClass and getIndexedIvars" {
+    const testing = std.testing;
+    const NSObject = objc.getClass("NSObject").?;
+
+    const ClassA = objc.allocateClassPair(NSObject, "ZigObjcSetClassA").?;
+    defer objc.disposeClassPair(ClassA);
+    try testing.expect(ClassA.addMethod("magicValue", struct {
+        fn imp(_: c.id, _: c.SEL) callconv(.c) u64 {
+            return 111;
+        }
+    }.imp));
+    objc.registerClassPair(ClassA);
+
+    const ClassB = objc.allocateClassPair(NSObject, "ZigObjcSetClassB").?;
+    defer objc.disposeClassPair(ClassB);
+    try testing.expect(ClassB.addMethod("magicValue", struct {
+        fn imp(_: c.id, _: c.SEL) callconv(.c) u64 {
+            return 222;
+        }
+    }.imp));
+    objc.registerClassPair(ClassB);
+
+    const inst = Object.allocInit(ClassA).?;
+    defer inst.release();
+
+    try testing.expectEqualStrings("ZigObjcSetClassA", inst.getClassName());
+    try testing.expectEqual(@as(u64, 111), inst.msgSend(u64, "magicValue", .{}));
+
+    const prev_cls = inst.setClass(ClassB).?;
+    try testing.expectEqual(ClassA.value, prev_cls.value);
+    try testing.expectEqualStrings("ZigObjcSetClassB", inst.getClassName());
+    try testing.expectEqual(@as(u64, 222), inst.msgSend(u64, "magicValue", .{}));
+
+    // Indexed ivars allocated via class_createInstance with extraBytes
+    const extra_bytes = @sizeOf([4]u64);
+    const indexed_obj = Object.fromId(c.class_createInstance(NSObject.value, extra_bytes))
+        .msgSend(Object, "init", .{});
+    defer indexed_obj.release();
+
+    const extra_ptr: *align(1) [4]u64 = @ptrCast(indexed_obj.getIndexedIvars().?);
+    try testing.expectEqual([4]u64{ 0, 0, 0, 0 }, extra_ptr.*);
+    extra_ptr.* = .{ 10, 20, 30, 40 };
+
+    const reread: *align(1) const [4]u64 = @ptrCast(indexed_obj.getIndexedIvars().?);
+    try testing.expectEqual([4]u64{ 10, 20, 30, 40 }, reread.*);
+}
+
+test "associated objects" {
+    const testing = std.testing;
+    const NSObject = objc.getClass("NSObject").?;
+    const NSMutableString = objc.getClass("NSMutableString").?;
+
+    const Keys = struct {
+        var retain_key: u8 = 0;
+        var copy_key: u8 = 0;
+        var dealloc_count: usize = 0;
+    };
+    Keys.dealloc_count = 0;
+
+    const Tracked = objc.allocateClassPair(NSObject, "ZigObjcAssocTracked").?;
+    defer objc.disposeClassPair(Tracked);
+    _ = Tracked.replaceMethod("dealloc", struct {
+        fn dealloc(target: c.id, _: c.SEL) callconv(.c) void {
+            Keys.dealloc_count += 1;
+            Object.fromId(target).msgSendSuper(objc.getClass("NSObject").?, void, "dealloc", .{});
+        }
+    }.dealloc);
+    objc.registerClassPair(Tracked);
+
+    const host = Object.allocInit(NSObject).?;
+    defer host.release();
+
+    try testing.expect(host.getAssociatedObject(&Keys.retain_key) == null);
+
+    // Retain policy keeps associated object alive after releasing local reference.
+    // Note: atomic `.retain` puts values returned by `objc_getAssociatedObject` into
+    // the active autorelease pool, so scope the pool around the lookups.
+    {
+        var pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
+
+        const val = Object.allocInit(Tracked).?;
+        host.setAssociatedObject(&Keys.retain_key, val, .retain);
+        val.release();
+
+        try testing.expectEqual(@as(usize, 0), Keys.dealloc_count);
+        try testing.expect(host.getAssociatedObject(&Keys.retain_key) != null);
+
+        // Copy policy snapshots mutable string
+        const mut_str = NSMutableString.msgSend(Object, "stringWithUTF8String:", .{"before"});
+        host.setAssociatedObject(&Keys.copy_key, mut_str, .copy_nonatomic);
+        const NSString = objc.getClass("NSString").?;
+        mut_str.msgSend(void, "appendString:", .{NSString.msgSend(Object, "stringWithUTF8String:", .{"_after"})});
+
+        const copied = host.getAssociatedObject(&Keys.copy_key).?;
+        try testing.expectEqualStrings("before", std.mem.span(copied.msgSend([*:0]const u8, "UTF8String", .{})));
+
+        // Clear single association with null
+        host.setAssociatedObject(&Keys.copy_key, null, .assign);
+        try testing.expect(host.getAssociatedObject(&Keys.copy_key) == null);
+    }
+    try testing.expectEqual(@as(usize, 0), Keys.dealloc_count);
+
+    // Remove all remaining associations and verify Tracked deallocated
+    host.removeAssociatedObjects();
+    try testing.expect(host.getAssociatedObject(&Keys.retain_key) == null);
+    try testing.expectEqual(@as(usize, 1), Keys.dealloc_count);
+}
+
+test "alloc, allocInit, autorelease, ARC helpers, and storeStrong" {
+    const testing = std.testing;
+    const NSObject = objc.getClass("NSObject").?;
+
+    const Stats = struct {
+        var init_count: usize = 0;
+        var dealloc_count: usize = 0;
+    };
+    Stats.init_count = 0;
+    Stats.dealloc_count = 0;
+
+    const Tracked = objc.allocateClassPair(NSObject, "ZigObjcLifecycleTracked").?;
+    defer objc.disposeClassPair(Tracked);
+    _ = Tracked.replaceMethod("init", struct {
+        fn init(target: c.id, _: c.SEL) callconv(.c) c.id {
+            Stats.init_count += 1;
+            return Object.fromId(target).msgSendSuper(objc.getClass("NSObject").?, Object, "init", .{}).value;
+        }
+    }.init);
+    _ = Tracked.replaceMethod("dealloc", struct {
+        fn dealloc(target: c.id, _: c.SEL) callconv(.c) void {
+            Stats.dealloc_count += 1;
+            Object.fromId(target).msgSendSuper(objc.getClass("NSObject").?, void, "dealloc", .{});
+        }
+    }.dealloc);
+    objc.registerClassPair(Tracked);
+
+    // alloc vs allocInit
+    {
+        const raw_alloc = Object.alloc(Tracked).?;
+        try testing.expectEqual(@as(usize, 0), Stats.init_count);
+        const initialized = raw_alloc.msgSend(Object, "init", .{});
+        try testing.expectEqual(@as(usize, 1), Stats.init_count);
+        initialized.release();
+        try testing.expectEqual(@as(usize, 1), Stats.dealloc_count);
+    }
+
+    // autorelease inside AutoreleasePool
+    {
+        var pool = objc.AutoreleasePool.init();
+        const auto_obj = Object.allocInit(Tracked).?;
+        try testing.expectEqual(@as(usize, 2), Stats.init_count);
+        _ = auto_obj.autorelease();
+        try testing.expectEqual(@as(usize, 1), Stats.dealloc_count);
+        pool.deinit();
+        try testing.expectEqual(@as(usize, 2), Stats.dealloc_count);
+    }
+
+    // retainAutorelease and return-value ARC helpers inside AutoreleasePool
+    {
+        const obj = Object.allocInit(Tracked).?;
+        {
+            var pool = objc.AutoreleasePool.init();
+            defer pool.deinit();
+
+            _ = obj.retainAutorelease();
+            try testing.expect(retainCount(obj) >= 2);
+
+            const rv1 = obj.retainAutoreleaseReturnValue();
+            const claimed = rv1.retainAutoreleasedReturnValue();
+            claimed.release();
+
+            const rv2 = obj.retainAutoreleaseReturnValue();
+            _ = rv2.unsafeClaimAutoreleasedReturnValue();
+        }
+        try testing.expectEqual(@as(c_ulong, 1), retainCount(obj));
+        try testing.expectEqual(@as(usize, 2), Stats.dealloc_count);
+        obj.release();
+        try testing.expectEqual(@as(usize, 3), Stats.dealloc_count);
+    }
+
+    // storeStrong lifecycle: nil -> obj_a -> self -> obj_b -> nil
+    var slot: ?Object = null;
+    {
+        const obj_a = Object.allocInit(Tracked).?;
+        Object.storeStrong(&slot, obj_a);
+        try testing.expectEqual(obj_a.value, slot.?.value);
+        obj_a.release();
+    }
+    try testing.expectEqual(@as(usize, 3), Stats.dealloc_count);
+
+    // Self-assignment keeps object alive
+    Object.storeStrong(&slot, slot);
+    try testing.expectEqual(@as(usize, 3), Stats.dealloc_count);
+
+    {
+        const obj_b = Object.allocInit(Tracked).?;
+        Object.storeStrong(&slot, obj_b);
+        // Overwriting slot released obj_a
+        try testing.expectEqual(@as(usize, 4), Stats.dealloc_count);
+        try testing.expectEqual(obj_b.value, slot.?.value);
+        obj_b.release();
+    }
+    try testing.expectEqual(@as(usize, 4), Stats.dealloc_count);
+
+    Object.storeStrong(&slot, null);
+    try testing.expect(slot == null);
+    try testing.expectEqual(@as(usize, 5), Stats.dealloc_count);
+}
+
+test "Object copy, dispose, isClass, setInstanceVariable, and synchronize" {
+    const testing = std.testing;
+    const NSObject = objc.getClass("NSObject").?;
+
+    const inst = Object.allocInit(NSObject).?;
+    defer inst.release();
+
+    // isClass distinguishes instances, classes, metaclasses, and nil
+    try testing.expect(!inst.isClass());
+    try testing.expect(!(Object{ .value = null }).isClass());
+    try testing.expect(Object.fromId(NSObject.value).isClass());
+    try testing.expect(Object.fromId(objc.getMetaClass("NSObject").?.value).isClass());
+
+    // object_copy + object_dispose
+    const copied = inst.copy(0);
+    try testing.expect(copied.value != null);
+    try testing.expect(copied.value != inst.value);
+    try testing.expectEqualStrings("NSObject", copied.getClassName());
+    copied.dispose();
+
+    // setInstanceVariable + getInstanceVariable
+    const Holder = objc.allocateClassPair(NSObject, "ZigObjcInstVarHolder").?;
+    try testing.expect(Holder.addIvar(?Object, "slot"));
+    objc.registerClassPair(Holder);
+    defer objc.disposeClassPair(Holder);
+
+    const holder = Object.allocInit(Holder).?;
+    defer holder.release();
+    holder.setInstanceVariable("slot", inst);
+    try testing.expectEqual(inst.value, holder.getInstanceVariable("slot").value);
+    holder.setInstanceVariable("slot", null);
+    try testing.expect(holder.getInstanceVariable("slot").value == null);
+
+    // Object.synchronize recursive monitor delegate
+    var outer_guard = try inst.synchronize();
+    defer outer_guard.unlock();
+    var inner_guard = try inst.synchronize();
+    inner_guard.unlock();
 }
