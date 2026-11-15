@@ -8,7 +8,17 @@ extern "c" fn zig_objc_try_catch(
     try_fn: *const fn (?*anyopaque) callconv(.c) void,
     ctx: ?*anyopaque,
     caught_out: *u8,
-) c.id;
+) ?*anyopaque;
+
+extern "c" fn objc_begin_catch(exc_buf: *anyopaque) ?*anyopaque;
+
+/// Errors raised when unwinding an Objective-C `@try / @catch` frame.
+pub const Error = error{
+    /// An Objective-C object exception (`@throw obj` or `@throw nil`) was caught.
+    ExceptionThrown,
+    /// A non-`id` foreign or C++ exception was caught via `@catch (...)`.
+    ForeignExceptionThrown,
+};
 
 /// Result of executing an operation inside an Objective-C `@try / @catch` frame.
 ///
@@ -17,11 +27,18 @@ extern "c" fn zig_objc_try_catch(
 /// `@catch` before `objc_end_catch` runs). The caller should call `.release()`
 /// on the returned `objc.Object` when done inspecting it.
 ///
-/// `.exception` is `null` only when `@throw nil` was caught.
+/// `.exception` is `null` when `@throw nil` or a foreign/C++ exception was caught;
+/// use `tryCallCatch` / `tryInvokeCatch` to distinguish `Error.ExceptionThrown`
+/// from `Error.ForeignExceptionThrown`.
 pub fn TryResult(comptime R: type) type {
     return union(enum) {
         ok: R,
         exception: ?objc.Object,
+
+        /// Reports whether an Objective-C or foreign exception was caught.
+        pub inline fn hasThrown(self: @This()) bool {
+            return self == .exception;
+        }
     };
 }
 
@@ -51,33 +68,69 @@ fn InvokeReturnType(comptime func: anytype, comptime Args: type) type {
 }
 
 /// Executes a C-ABI callback `try_fn(context)` inside an Objective-C
+/// `@try / @catch` frame, returning `Error.ExceptionThrown` for Objective-C
+/// `id` exceptions and `Error.ForeignExceptionThrown` for foreign/C++ exceptions.
+///
+/// If `caught_out` is non-null, stores the `+1`-retained Objective-C exception
+/// (or `null` for `@throw nil` or foreign exceptions) into `caught_out.*`; if
+/// `caught_out` is `null`, any caught Objective-C exception is released before
+/// returning `error.ExceptionThrown`.
+pub fn tryCallCatch(
+    try_fn: *const fn (?*anyopaque) callconv(.c) void,
+    context: ?*anyopaque,
+    caught_out: ?*?objc.Object,
+) Error!void {
+    var status: u8 = 0;
+    const raw_exc = zig_objc_try_catch(try_fn, context, &status);
+    if (status == 0) {
+        @branchHint(.likely);
+        return;
+    }
+
+    return switch (status) {
+        1 => {
+            const exc_obj: ?objc.Object = if (raw_exc) |ptr| objc.Object.fromId(ptr) else null;
+            if (caught_out) |out| {
+                out.* = exc_obj;
+            } else if (exc_obj) |obj| {
+                obj.release();
+            }
+            return error.ExceptionThrown;
+        },
+        2 => {
+            if (caught_out) |out| {
+                out.* = null;
+            }
+            return error.ForeignExceptionThrown;
+        },
+        else => unreachable,
+    };
+}
+
+/// Executes a C-ABI callback `try_fn(context)` inside an Objective-C
 /// `@try / @catch` frame.
 ///
 /// Returns `.{ .ok = {} }` if `try_fn` returns normally, or `.{ .exception = exc }`
-/// if an Objective-C exception was thrown (`exc` has `+1` retain count when
-/// non-null; call `.release()` when done).
+/// if an Objective-C or foreign exception was thrown (`exc` has `+1` retain count
+/// when non-null; call `.release()` when done).
 pub fn tryCall(
     try_fn: *const fn (?*anyopaque) callconv(.c) void,
     context: ?*anyopaque,
 ) TryResult(void) {
-    var caught: u8 = 0;
-    const raw_exc = zig_objc_try_catch(try_fn, context, &caught);
-    if (caught != 0) {
-        return .{ .exception = if (raw_exc != null) .{ .value = raw_exc } else null };
-    }
+    var caught_exc: ?objc.Object = null;
+    tryCallCatch(try_fn, context, &caught_exc) catch {
+        return .{ .exception = caught_exc };
+    };
     return .{ .ok = {} };
 }
 
-/// Invokes `@call(.auto, func, args)` inside an Objective-C `@try / @catch` frame.
-///
-/// Returns `.{ .ok = result }` if `func` completes without throwing an
-/// Objective-C exception, or `.{ .exception = exc }` if an exception is caught.
-/// When `exc` is non-null, it is returned at `+1` retain count and the caller
-/// should call `.release()` when finished inspecting it.
-pub fn tryInvoke(
+/// Invokes `@call(.auto, func, args)` inside an Objective-C `@try / @catch` frame,
+/// returning `Error!R` and storing any caught `+1` Objective-C exception in `caught_out`.
+pub fn tryInvokeCatch(
     comptime func: anytype,
     args: anytype,
-) TryResult(InvokeReturnType(func, @TypeOf(args))) {
+    caught_out: ?*?objc.Object,
+) Error!InvokeReturnType(func, @TypeOf(args)) {
     const Args = @TypeOf(args);
     const R = InvokeReturnType(func, Args);
 
@@ -99,15 +152,49 @@ pub fn tryInvoke(
     };
 
     var ctx: Context = .{ .args = args };
-    return switch (tryCall(&Context.run, @ptrCast(&ctx))) {
-        .ok => if (R == noreturn) unreachable else .{ .ok = ctx.result },
-        .exception => |exc| .{ .exception = exc },
+    try tryCallCatch(&Context.run, @ptrCast(&ctx), caught_out);
+    return if (R == noreturn) unreachable else ctx.result;
+}
+
+/// Invokes `@call(.auto, func, args)` inside an Objective-C `@try / @catch` frame.
+///
+/// Returns `.{ .ok = result }` if `func` completes without throwing, or
+/// `.{ .exception = exc }` if an Objective-C or foreign exception is caught.
+/// When `exc` is non-null, it is returned at `+1` retain count and the caller
+/// should call `.release()` when finished inspecting it.
+pub fn tryInvoke(
+    comptime func: anytype,
+    args: anytype,
+) TryResult(InvokeReturnType(func, @TypeOf(args))) {
+    var caught_exc: ?objc.Object = null;
+    const val = tryInvokeCatch(func, args, &caught_exc) catch {
+        return .{ .exception = caught_exc };
     };
+    return .{ .ok = val };
+}
+
+/// Sends an Objective-C message inside `@try / @catch`, returning `Error!Return`.
+pub fn msgSendCatch(
+    target: anytype,
+    comptime Return: type,
+    sel_raw: anytype,
+    args: anytype,
+    caught_out: ?*?objc.Object,
+) Error!Return {
+    const Target = @TypeOf(target);
+    const SelRaw = @TypeOf(sel_raw);
+    const Args = @TypeOf(args);
+    const Helper = struct {
+        inline fn call(t: Target, s: SelRaw, a: Args) Return {
+            return t.msgSend(Return, s, a);
+        }
+    };
+    return tryInvokeCatch(Helper.call, .{ target, sel_raw, args }, caught_out);
 }
 
 /// Sends an Objective-C message (`target.msgSend(Return, sel_raw, args)`) inside
-/// an Objective-C `@try / @catch` frame, catching any thrown `NSException` or
-/// Objective-C object instead of aborting the process.
+/// an Objective-C `@try / @catch` frame, catching any thrown `NSException`,
+/// Objective-C object, or foreign exception instead of aborting the process.
 ///
 /// When `.exception` is non-null, it has `+1` retain ownership and the caller
 /// should call `.release()` when finished inspecting it.
@@ -117,15 +204,31 @@ pub fn msgSendTry(
     sel_raw: anytype,
     args: anytype,
 ) TryResult(Return) {
+    var caught_exc: ?objc.Object = null;
+    const val = msgSendCatch(target, Return, sel_raw, args, &caught_exc) catch {
+        return .{ .exception = caught_exc };
+    };
+    return .{ .ok = val };
+}
+
+/// Sends an Objective-C superclass message inside `@try / @catch`, returning `Error!Return`.
+pub fn msgSendSuperCatch(
+    target: anytype,
+    superclass: objc.Class,
+    comptime Return: type,
+    sel_raw: anytype,
+    args: anytype,
+    caught_out: ?*?objc.Object,
+) Error!Return {
     const Target = @TypeOf(target);
     const SelRaw = @TypeOf(sel_raw);
     const Args = @TypeOf(args);
     const Helper = struct {
-        fn call(t: Target, s: SelRaw, a: Args) Return {
-            return t.msgSend(Return, s, a);
+        inline fn call(t: Target, sup: objc.Class, s: SelRaw, a: Args) Return {
+            return t.msgSendSuper(sup, Return, s, a);
         }
     };
-    return tryInvoke(Helper.call, .{ target, sel_raw, args });
+    return tryInvokeCatch(Helper.call, .{ target, superclass, sel_raw, args }, caught_out);
 }
 
 /// Sends an Objective-C superclass message
@@ -141,15 +244,11 @@ pub fn msgSendSuperTry(
     sel_raw: anytype,
     args: anytype,
 ) TryResult(Return) {
-    const Target = @TypeOf(target);
-    const SelRaw = @TypeOf(sel_raw);
-    const Args = @TypeOf(args);
-    const Helper = struct {
-        fn call(t: Target, sup: objc.Class, s: SelRaw, a: Args) Return {
-            return t.msgSendSuper(sup, Return, s, a);
-        }
+    var caught_exc: ?objc.Object = null;
+    const val = msgSendSuperCatch(target, superclass, Return, sel_raw, args, &caught_exc) catch {
+        return .{ .exception = caught_exc };
     };
-    return tryInvoke(Helper.call, .{ target, superclass, sel_raw, args });
+    return .{ .ok = val };
 }
 
 /// Throws an Objective-C runtime exception (`objc_exception_throw` / `@throw`).
@@ -167,8 +266,8 @@ pub fn rethrow() noreturn {
 
 /// Low-level ABI function called at the start of an Objective-C `@catch` block.
 pub fn beginCatch(exc_buf: *anyopaque) ?objc.Object {
-    const raw = c.objc_begin_catch(exc_buf);
-    return if (raw != null) .{ .value = raw } else null;
+    const raw = objc_begin_catch(exc_buf);
+    return if (raw) |ptr| objc.Object.fromId(ptr) else null;
 }
 
 /// Low-level ABI function called when exiting an Objective-C `@catch` block.
@@ -613,6 +712,135 @@ test "addExceptionHandler and removeExceptionHandler on macOS" {
         defer followup_caught.release();
         try testing.expectEqual(@as(usize, 1), state3.call_count);
     }
+}
+
+test "non-NSException NSNumber throw, @throw nil, foreign C++ exception, and fast-path return types" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSRect = extern struct { x: f64, y: f64, w: f64, h: f64 };
+    const NSDecimalNumber = objc.getClass("NSDecimalNumber").?;
+    const NSNumber = objc.getClass("NSNumber").?;
+    const NSString = objc.getClass("NSString").?;
+
+    const Helpers = struct {
+        const AllocExcFn = *const fn (usize) callconv(.c) *anyopaque;
+        const ThrowExcFn = *const fn (
+            *anyopaque,
+            ?*const anyopaque,
+            ?*const fn (*anyopaque) callconv(.c) void,
+        ) callconv(.c) noreturn;
+
+        fn addScalars(a: i64, b: i64) i64 {
+            return a + b;
+        }
+
+        fn makeRect(scale: f64) NSRect {
+            return .{ .x = 1.0 * scale, .y = 2.0 * scale, .w = 3.0 * scale, .h = 4.0 * scale };
+        }
+
+        fn maybeObj(present: bool) ?objc.Object {
+            if (!present) return null;
+            return objc.getClass("NSString").?.msgSend(objc.Object, "stringWithUTF8String:", .{"ok"});
+        }
+
+        fn noopVoid(counter: *usize) void {
+            counter.* += 1;
+        }
+
+        fn throwObj(obj: ?objc.Object) i32 {
+            throw(obj);
+        }
+
+        fn throwForeignInt(code: c_int) NSRect {
+            const cxxabi = std.c.dlopen("/usr/lib/libc++abi.dylib", .{ .LAZY = true }) orelse
+                @panic("failed to dlopen libc++abi.dylib");
+            const alloc_exc: AllocExcFn = @ptrCast(@alignCast(std.c.dlsym(cxxabi, "__cxa_allocate_exception") orelse
+                @panic("missing __cxa_allocate_exception")));
+            const throw_exc: ThrowExcFn = @ptrCast(@alignCast(std.c.dlsym(cxxabi, "__cxa_throw") orelse
+                @panic("missing __cxa_throw")));
+            const int_tinfo: *const anyopaque = std.c.dlsym(cxxabi, "_ZTIi") orelse
+                @panic("missing _ZTIi");
+
+            const slot: *c_int = @ptrCast(@alignCast(alloc_exc(@sizeOf(c_int))));
+            slot.* = code;
+            throw_exc(slot, int_tinfo, null);
+        }
+    };
+
+    // 1. Non-throwing fast path returning void, scalar, NSRect struct, and ?objc.Object
+    var visits: usize = 0;
+    try tryInvokeCatch(Helpers.noopVoid, .{&visits}, null);
+    try testing.expectEqual(@as(usize, 1), visits);
+
+    const sum = try tryInvokeCatch(Helpers.addScalars, .{ 19, 23 }, null);
+    try testing.expectEqual(@as(i64, 42), sum);
+
+    const scalar_res = tryInvoke(Helpers.makeRect, .{2.5});
+    try testing.expect(!scalar_res.hasThrown());
+    try testing.expectEqual(@as(f64, 10.0), scalar_res.ok.h);
+
+    const rect = try tryInvokeCatch(Helpers.makeRect, .{3.0}, null);
+    try testing.expectEqual(@as(f64, 3.0), rect.x);
+    try testing.expectEqual(@as(f64, 12.0), rect.h);
+
+    const opt_some = try tryInvokeCatch(Helpers.maybeObj, .{true}, null);
+    try testing.expectEqualStrings("ok", std.mem.span(opt_some.?.msgSend([*:0]const u8, "UTF8String", .{})));
+    const opt_none = try tryInvokeCatch(Helpers.maybeObj, .{false}, null);
+    try testing.expect(opt_none == null);
+
+    // Verify Object.fromId on unaligned tagged-pointer NSNumber (`@(42)`) via ?*anyopaque
+    const tagged_num = NSNumber.msgSend(objc.Object, "numberWithInt:", .{@as(c_int, 42)});
+    const raw_tagged: ?*anyopaque = @ptrFromInt(@intFromPtr(tagged_num.value));
+    const roundtrip_tagged = objc.Object.fromId(raw_tagged.?);
+    try testing.expectEqual(@as(c_int, 42), roundtrip_tagged.msgSend(c_int, "intValue", .{}));
+
+    // 2. Throw and catch a non-NSException NSNumber subclass (`NSDecimalNumber`; macOS libobjc
+    // `_objc_fatal`s inside `objc_exception_throw` if given a tagged pointer directly).
+    const forty_two_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"42"});
+    const heap_num = NSDecimalNumber.msgSend(objc.Object, "decimalNumberWithString:", .{forty_two_str});
+    var caught_num: ?objc.Object = null;
+    try testing.expectError(
+        error.ExceptionThrown,
+        tryInvokeCatch(Helpers.throwObj, .{@as(?objc.Object, heap_num)}, &caught_num),
+    );
+    try testing.expect(caught_num != null);
+    defer caught_num.?.release();
+    try testing.expectEqual(@as(c_int, 42), caught_num.?.msgSend(c_int, "intValue", .{}));
+
+    const try_res_num = tryInvoke(Helpers.throwObj, .{@as(?objc.Object, heap_num)});
+    try testing.expect(try_res_num.hasThrown());
+    try testing.expectEqual(@as(c_int, 42), try_res_num.exception.?.msgSend(c_int, "intValue", .{}));
+    try_res_num.exception.?.release();
+
+    // 3. `@throw nil;` -> Error.ExceptionThrown with caught_out == null
+    var caught_nil: ?objc.Object = tagged_num;
+    try testing.expectError(
+        error.ExceptionThrown,
+        tryInvokeCatch(Helpers.throwObj, .{@as(?objc.Object, null)}, &caught_nil),
+    );
+    try testing.expect(caught_nil == null);
+
+    // Passing `caught_out = null` on a real Objective-C object exception releases it without leaking
+    const NSMutableString = objc.getClass("NSMutableString").?;
+    const str_exc = NSMutableString.msgSend(objc.Object, "stringWithUTF8String:", .{"discarded"});
+    try testing.expectError(
+        error.ExceptionThrown,
+        tryInvokeCatch(Helpers.throwObj, .{@as(?objc.Object, str_exc)}, null),
+    );
+
+    // 4. Foreign C++ exception (`throw 404;`) caught via `@catch (...)` -> Error.ForeignExceptionThrown
+    var caught_foreign: ?objc.Object = tagged_num;
+    try testing.expectError(
+        error.ForeignExceptionThrown,
+        tryInvokeCatch(Helpers.throwForeignInt, .{@as(c_int, 404)}, &caught_foreign),
+    );
+    try testing.expect(caught_foreign == null);
+
+    const foreign_try = tryInvoke(Helpers.throwForeignInt, .{@as(c_int, 500)});
+    try testing.expect(foreign_try.hasThrown());
+    try testing.expect(foreign_try.exception == null);
 }
 
 test {
