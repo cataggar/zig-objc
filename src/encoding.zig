@@ -137,7 +137,10 @@ fn comptimeEncodeInner(
         else => switch (@typeInfo(T)) {
             .@"opaque" => "v",
             .@"enum" => |m| comptimeEncodeInner(m.tag_type, show_type_spec, visited),
-            .array => |arr| "[" ++ comptimeUintToStr(arr.len) ++ comptimeEncodeInner(arr.child, true, visited) ++ "]",
+            .array => |arr| blk: {
+                rejectOptionalWrapperElement(arr.child);
+                break :blk "[" ++ comptimeUintToStr(arr.len) ++ comptimeEncodeInner(arr.child, true, visited) ++ "]";
+            },
             .vector => |vec| "![" ++ comptimeUintToStr(@sizeOf(T)) ++ "," ++ comptimeUintToStr(@alignOf(T)) ++ comptimeEncodeInner(vec.child, true, visited) ++ "]",
             .@"struct" => |m| if (isObjcBlockType(T))
                 "@?"
@@ -151,6 +154,7 @@ fn comptimeEncodeInner(
                     const next_visited = visited ++ &[_]type{T};
                     var fields_str: []const u8 = "";
                     for (m.field_types) |FieldType| {
+                        rejectOptionalWrapperElement(FieldType);
                         fields_str = fields_str ++ comptimeEncodeInner(FieldType, true, next_visited);
                     }
                     break :blk "{" ++ tag_name ++ "=" ++ fields_str ++ "}";
@@ -167,6 +171,7 @@ fn comptimeEncodeInner(
                     const next_visited = visited ++ &[_]type{T};
                     var fields_str: []const u8 = "";
                     for (u.field_types) |FieldType| {
+                        rejectOptionalWrapperElement(FieldType);
                         fields_str = fields_str ++ comptimeEncodeInner(FieldType, true, next_visited);
                     }
                     break :blk "(" ++ tag_name ++ "=" ++ fields_str ++ ")";
@@ -210,10 +215,22 @@ fn comptimeEncodeInner(
     };
 }
 
+fn rejectOptionalWrapperElement(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .optional => |opt| {
+            if (@typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice) {
+                @compileError("pointer/array element " ++ @typeName(T) ++ " is a 16-byte Zig optional struct, not an 8-byte C pointer; for Objective-C out-parameters like id* / NSError**, use *objc.Object (initialized to .{ .value = null }) or *objc.c.id");
+            }
+        },
+        else => {},
+    }
+}
+
 fn comptimeEncodePointer(comptime PtrType: type, comptime visited: []const type) []const u8 {
     const pointer_info = indirectionCountAndType(PtrType);
     const carets: [pointer_info.indirection_levels]u8 = @splat('^');
     const Child = pointer_info.child;
+    rejectOptionalWrapperElement(Child);
 
     // Non-extern Zig structs/unions have no C field layout, so behind a pointer
     // (`*MyZigState`) they encode as opaque `^v` (`void *`).
@@ -308,7 +325,10 @@ pub const Encoding = union(enum) {
             else => switch (@typeInfo(T)) {
                 .@"opaque" => .void,
                 .@"enum" => |m| .init(m.tag_type),
-                .array => |arr| .{ .array = .{ .len = arr.len, .arr_type = arr.child } },
+                .array => |arr| blk: {
+                    rejectOptionalWrapperElement(arr.child);
+                    break :blk .{ .array = .{ .len = arr.len, .arr_type = arr.child } };
+                },
                 .vector => |vec| .{ .vector = .{
                     .elem_type = vec.child,
                     .size = @sizeOf(T),
@@ -340,9 +360,16 @@ pub const Encoding = union(enum) {
                         .fn_pointer
                     else if (isBlockContextStruct(ptr.child))
                         .block
-                    else
-                        .{ .pointer = .{ .ptr_type = T, .size = ptr.size } },
-                    .many => .{ .pointer = .{ .ptr_type = T, .size = ptr.size } },
+                    else blk: {
+                        const info = indirectionCountAndType(T);
+                        rejectOptionalWrapperElement(info.child);
+                        break :blk .{ .pointer = .{ .ptr_type = T, .size = ptr.size } };
+                    },
+                    .many => blk: {
+                        const info = indirectionCountAndType(T);
+                        rejectOptionalWrapperElement(info.child);
+                        break :blk .{ .pointer = .{ .ptr_type = T, .size = ptr.size } };
+                    },
                     .slice => @compileError("Objective-C type encoding does not support Zig slices: " ++ @typeName(T)),
                 },
                 .@"fn" => |fn_info| blk: {
@@ -417,6 +444,7 @@ pub const Encoding = union(enum) {
                     const next_visited = visited ++ &[_]type{s.struct_type};
                     try writer.writeAll("=");
                     inline for (struct_info.@"struct".field_types) |field_type| {
+                        comptime rejectOptionalWrapperElement(field_type);
                         const field_encode = init(field_type);
                         try field_encode.formatWithVisited(writer, next_visited);
                     }
@@ -437,6 +465,7 @@ pub const Encoding = union(enum) {
                     const next_visited = visited ++ &[_]type{u.union_type};
                     try writer.writeAll("=");
                     inline for (union_info.@"union".field_types) |field_type| {
+                        comptime rejectOptionalWrapperElement(field_type);
                         const field_encode = init(field_type);
                         try field_encode.formatWithVisited(writer, next_visited);
                     }
@@ -519,15 +548,11 @@ fn isDirectEncodedType(comptime T: type) bool {
     return switch (T) {
         c.id,
         objc.Object,
-        ?objc.Object,
         c.Class,
         objc.Class,
-        ?objc.Class,
         c.SEL,
         objc.Sel,
-        ?objc.Sel,
         objc.Protocol,
-        ?objc.Protocol,
         *c.Protocol,
         *const c.Protocol,
         ?*c.Protocol,
@@ -539,7 +564,9 @@ fn isDirectEncodedType(comptime T: type) bool {
         => true,
         else => switch (@typeInfo(T)) {
             .@"struct" => isObjcBlockType(T),
-            .optional => |opt| isDirectEncodedType(opt.child),
+            .optional => |opt| @typeInfo(opt.child) == .pointer and
+                @typeInfo(opt.child).pointer.size != .slice and
+                isDirectEncodedType(opt.child),
             .pointer => |ptr| switch (ptr.size) {
                 .one, .c => @typeInfo(ptr.child) == .@"fn" or isBlockContextStruct(ptr.child),
                 else => false,
@@ -1328,7 +1355,8 @@ test "comptime encodings for NSInteger, 128-bit ints, long double, fn pointers, 
     try encodingMatchesType(objc.Object, "@");
     try encodingMatchesType(?objc.Object, "@");
     try encodingMatchesType(*objc.Object, "^@");
-    try encodingMatchesType(*?objc.Object, "^@");
+    try encodingMatchesType(?*objc.Object, "^@");
+    try encodingMatchesType(*c.id, "^@");
     try encodingMatchesType(objc.Class, "#");
     try encodingMatchesType(?objc.Class, "#");
     try encodingMatchesType(objc.Protocol, "@");

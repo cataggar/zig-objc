@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const abi = @import("abi.zig");
 const block_pkg = @import("block.zig");
 const cpkg = @import("c.zig");
 const c = cpkg.c;
@@ -27,8 +28,8 @@ pub const Class = extern struct {
     pub const msgSendSuperVarargsTry = msg_send.msgSendSuperVarargsTry;
 
     /// Looks up and caches the permanent/framework `Class` named `name` in a lock-free
-    /// `.unordered` atomic static slot per comptime class name (`objc_getClass` runs once
-    /// on first call, caching both existing classes and `null` for missing classes).
+    /// `.acquire`/`.release` atomic static slot per comptime class name (`objc_getClass`
+    /// runs once on first call, caching both existing classes and `null` for missing classes).
     ///
     /// Intended only for permanent/framework classes (such as `"NSString"`), **not**
     /// dynamically created classes that may later be destroyed with `disposeClassPair`.
@@ -361,6 +362,7 @@ pub const Class = extern struct {
     /// Must only be called between `allocateClassPair` and `registerClassPair` on a
     /// non-metaclass. Computes `@sizeOf(T)`, `log2(@alignOf(T))`, and `comptimeEncode(T)`.
     pub fn addIvar(self: Class, comptime T: type, name: [:0]const u8) bool {
+        comptime validateAddIvarType(T);
         const alignment_log2: u8 = @intCast(std.math.log2_int(usize, @alignOf(T)));
         const types = comptime objc.comptimeEncode(T);
         return self.addIvarRaw(name, @sizeOf(T), alignment_log2, &types);
@@ -392,6 +394,95 @@ pub const Class = extern struct {
     }
 };
 
+fn validateAddIvarNestedElement(comptime T: type, comptime seen: []const type) void {
+    switch (@typeInfo(T)) {
+        .optional => |opt| {
+            if (abi.WrapperUnderlying(opt.child) != null or abi.isBlockRefType(opt.child) or
+                @typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice)
+            {
+                @compileError("Class.addIvar cannot store 16-byte Zig optional struct " ++ @typeName(T) ++ " inside a pointer/array/aggregate; use objc.Object, objc.Class, *objc.Object, or ?*MyZigState instead");
+            }
+            validateAddIvarNestedElement(@typeInfo(opt.child).pointer.child, seen);
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                @compileError("Class.addIvar does not support Zig slices (" ++ @typeName(T) ++ "); store a pointer and length or ?*MyZigState instead");
+            }
+            for (seen) |prev| {
+                if (prev == ptr.child) return;
+            }
+            validateAddIvarNestedElement(ptr.child, seen ++ &[_]type{ptr.child});
+        },
+        .array => |arr| {
+            if (@typeInfo(arr.child) == .@"struct" and @typeInfo(arr.child).@"struct".layout == .auto) {
+                @compileError("Class.addIvar requires extern/packed array elements, got auto-layout struct " ++ @typeName(arr.child));
+            }
+            if (@typeInfo(arr.child) == .@"union" and @typeInfo(arr.child).@"union".layout == .auto) {
+                @compileError("Class.addIvar requires extern/packed array elements, got auto-layout union " ++ @typeName(arr.child));
+            }
+            validateAddIvarNestedElement(arr.child, seen);
+        },
+        .@"struct" => |s| {
+            if (s.layout == .@"extern") {
+                for (s.field_types) |FieldType| {
+                    validateAddIvarNestedElement(FieldType, seen);
+                }
+            }
+        },
+        .@"union" => |u| {
+            if (u.layout == .@"extern") {
+                for (u.field_types) |FieldType| {
+                    validateAddIvarNestedElement(FieldType, seen);
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+fn validateAddIvarType(comptime T: type) void {
+    if (abi.WrapperUnderlying(T) != null or abi.isBlockRefType(T)) return;
+
+    switch (@typeInfo(T)) {
+        .optional => |opt| {
+            if (abi.WrapperUnderlying(opt.child) != null or abi.isBlockRefType(opt.child) or
+                @typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice)
+            {
+                @compileError("Class.addIvar cannot use 16-byte Zig optional struct " ++ @typeName(T) ++ " for an 8-byte Objective-C ivar; use objc.Object, objc.Class, objc.Sel, objc.c.id, or ?*MyZigState instead");
+            }
+            validateAddIvarNestedElement(@typeInfo(opt.child).pointer.child, &.{});
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                @compileError("Class.addIvar does not support Zig slices (" ++ @typeName(T) ++ "); store a pointer and length or *MyZigState instead");
+            }
+            validateAddIvarNestedElement(ptr.child, &.{ptr.child});
+        },
+        .array => validateAddIvarNestedElement(T, &.{}),
+        .@"struct" => |s| {
+            if (s.layout == .auto) {
+                @compileError("Class.addIvar requires an extern/packed struct or pointer (*" ++ @typeName(T) ++ "), got auto-layout struct " ++ @typeName(T));
+            }
+            if (s.layout == .@"extern") {
+                for (s.field_types) |FieldType| {
+                    validateAddIvarNestedElement(FieldType, &.{T});
+                }
+            }
+        },
+        .@"union" => |u| {
+            if (u.layout == .auto) {
+                @compileError("Class.addIvar requires an extern/packed union or pointer (*" ++ @typeName(T) ++ "), got auto-layout union " ++ @typeName(T));
+            }
+            if (u.layout == .@"extern") {
+                for (u.field_types) |FieldType| {
+                    validateAddIvarNestedElement(FieldType, &.{T});
+                }
+            }
+        },
+        else => {},
+    }
+}
+
 fn validateImpFn(comptime Fn: type) void {
     if (@typeInfo(Fn) != .@"fn") {
         @compileError("IMP must be a function type, got " ++ @typeName(Fn));
@@ -422,6 +513,16 @@ fn validateImpFn(comptime Fn: type) void {
     if (Selector != c.SEL and Selector != objc.Sel) {
         @compileError("Objective-C IMP second parameter (_cmd) must be objc.Sel or c.SEL, got " ++ @typeName(Selector));
     }
+    const Ret = fn_info.return_type orelse
+        @compileError("Objective-C IMP return type cannot be generic: " ++ @typeName(Fn));
+    if (Ret != void) {
+        abi.validateImpParamOrReturn(Ret);
+    }
+    for (fn_info.param_types[2..]) |maybe_param| {
+        const Param = maybe_param orelse
+            @compileError("Objective-C IMP parameter cannot be generic (`anytype`): " ++ @typeName(Fn));
+        abi.validateImpParamOrReturn(Param);
+    }
 }
 
 inline fn resolveSel(sel_or_name: anytype) objc.Sel {
@@ -433,8 +534,8 @@ inline fn resolveSel(sel_or_name: anytype) objc.Sel {
 }
 
 /// Looks up and caches the permanent/framework `Class` named `name` in a lock-free
-/// `.unordered` atomic static slot per comptime class name (`objc_getClass` runs once
-/// on first call, caching both existing classes and `null` for missing classes).
+/// `.acquire`/`.release` atomic static slot per comptime class name (`objc_getClass`
+/// runs once on first call, caching both existing classes and `null` for missing classes).
 ///
 /// NOTE: Intended only for permanent or framework classes whose lifetime spans the
 /// process (such as `"NSString"` or `"NSObject"`). Do **not** use `getClassCached` /
@@ -452,13 +553,13 @@ pub inline fn getClassCached(comptime name: [:0]const u8) ?Class {
                 ?*anyopaque,
                 &slot,
                 if (resolved) |cls_ptr| @ptrCast(cls_ptr) else null,
-                .unordered,
+                .release,
             );
             return .{ .value = resolved orelse return null };
         }
     };
 
-    const cached_ptr = @atomicLoad(?*anyopaque, &Cache.slot, .unordered);
+    const cached_ptr = @atomicLoad(?*anyopaque, &Cache.slot, .acquire);
     if (cached_ptr != @as(?*anyopaque, @ptrCast(&Cache.unresolved_sentinel))) {
         const raw: c.Class = if (cached_ptr) |p| @ptrCast(@alignCast(p)) else return null;
         return .{ .value = raw };
@@ -957,7 +1058,7 @@ test "getName, getSuperclass, getVersion/setVersion, getImageName, ivar layouts,
     try testing.expect(img.len > 0);
 
     const cls = allocateClassPairExtra(NSObject, "ZigObjcMetaInfoClass", 0).?;
-    try testing.expect(cls.addIvar(?objc.Object, "strong_slot"));
+    try testing.expect(cls.addIvar(objc.Object, "strong_slot"));
     const layout_bytes: [:0]const u8 = "\x01";
     cls.setIvarLayout(layout_bytes.ptr);
     cls.setWeakIvarLayout(null);

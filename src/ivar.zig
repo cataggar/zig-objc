@@ -1,4 +1,5 @@
 const std = @import("std");
+const abi = @import("abi.zig");
 const cpkg = @import("c.zig");
 const c = cpkg.c;
 const boolResult = cpkg.boolResult;
@@ -34,12 +35,100 @@ pub const Ivar = extern struct {
     }
 };
 
+pub fn validateDirectIvarType(comptime T: type) void {
+    if (T == objc.Object or T == ?objc.Object or T == c.id) {
+        @compileError("Objective-C object ivars must use Object.getIvar / Object.setIvar / Object.setIvarWithStrongDefault instead of direct byte-offset pointers");
+    }
+    switch (@typeInfo(T)) {
+        .optional => |opt| {
+            if (abi.WrapperUnderlying(opt.child) != null or abi.isBlockRefType(opt.child) or
+                @typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice)
+            {
+                @compileError("ivar type " ++ @typeName(T) ++ " is a 16-byte Zig optional struct, not an 8-byte Objective-C handle; use the non-optional wrapper (e.g. objc.Class, objc.Sel, BlockRef) or ?*MyZigState instead");
+            }
+            validateDirectIvarNestedElement(@typeInfo(opt.child).pointer.child, &.{});
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                @compileError("direct ivar access does not support Zig slices (" ++ @typeName(T) ++ "); store a pointer (*MyZigState) instead");
+            }
+            validateDirectIvarNestedElement(ptr.child, &.{ptr.child});
+        },
+        .array => validateDirectIvarNestedElement(T, &.{}),
+        .@"struct" => |s| {
+            if (s.layout == .auto) {
+                @compileError("direct ivar access requires an extern/packed struct or pointer (*" ++ @typeName(T) ++ "), got auto-layout struct " ++ @typeName(T));
+            }
+            if (s.layout == .@"extern") {
+                for (s.field_types) |FieldType| {
+                    validateDirectIvarNestedElement(FieldType, &.{T});
+                }
+            }
+        },
+        .@"union" => |u| {
+            if (u.layout == .auto) {
+                @compileError("direct ivar access requires an extern/packed union or pointer (*" ++ @typeName(T) ++ "), got auto-layout union " ++ @typeName(T));
+            }
+            if (u.layout == .@"extern") {
+                for (u.field_types) |FieldType| {
+                    validateDirectIvarNestedElement(FieldType, &.{T});
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+fn validateDirectIvarNestedElement(comptime T: type, comptime seen: []const type) void {
+    switch (@typeInfo(T)) {
+        .optional => |opt| {
+            if (abi.WrapperUnderlying(opt.child) != null or abi.isBlockRefType(opt.child) or
+                @typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice)
+            {
+                @compileError("ivar element " ++ @typeName(T) ++ " is a 16-byte Zig optional struct, not an 8-byte Objective-C pointer");
+            }
+            validateDirectIvarNestedElement(@typeInfo(opt.child).pointer.child, seen);
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                @compileError("ivar element cannot be Zig slice " ++ @typeName(T));
+            }
+            for (seen) |prev| {
+                if (prev == ptr.child) return;
+            }
+            validateDirectIvarNestedElement(ptr.child, seen ++ &[_]type{ptr.child});
+        },
+        .array => |arr| {
+            if (@typeInfo(arr.child) == .@"struct" and @typeInfo(arr.child).@"struct".layout == .auto) {
+                @compileError("ivar array element requires extern/packed struct, got auto-layout struct " ++ @typeName(arr.child));
+            }
+            if (@typeInfo(arr.child) == .@"union" and @typeInfo(arr.child).@"union".layout == .auto) {
+                @compileError("ivar array element requires extern/packed union, got auto-layout union " ++ @typeName(arr.child));
+            }
+            validateDirectIvarNestedElement(arr.child, seen);
+        },
+        .@"struct" => |s| {
+            if (s.layout == .@"extern") {
+                for (s.field_types) |FieldType| {
+                    validateDirectIvarNestedElement(FieldType, seen);
+                }
+            }
+        },
+        .@"union" => |u| {
+            if (u.layout == .@"extern") {
+                for (u.field_types) |FieldType| {
+                    validateDirectIvarNestedElement(FieldType, seen);
+                }
+            }
+        },
+        else => {},
+    }
+}
+
 /// Cached byte-offset handle for zero-overhead access to a non-object Zig instance
 /// variable (`*MyZigState`, scalars, `extern struct`s) across instances of the same class.
 pub fn IvarSlot(comptime T: type) type {
-    if (T == objc.Object or T == ?objc.Object or T == c.id) {
-        @compileError("IvarSlot does not support Objective-C object ivars; use Object.getIvar / Object.setIvar for ARC-safe access");
-    }
+    comptime validateDirectIvarType(T);
     return struct {
         const Self = @This();
         const unresolved_offset: isize = std.math.minInt(isize);
@@ -63,15 +152,15 @@ pub fn IvarSlot(comptime T: type) type {
             const cls = c.object_getClass(obj.value) orelse return null;
             const raw_ivar = c.class_getInstanceVariable(cls, ivar_name.ptr) orelse return null;
             const off: isize = @intCast(c.ivar_getOffset(raw_ivar));
-            @atomicStore(isize, offset_slot, off, .unordered);
+            @atomicStore(isize, offset_slot, off, .monotonic);
             return off;
         }
 
-        /// Resolves lazily once (lock-free `.unordered` atomic) on first access against `obj`,
+        /// Resolves lazily once (lock-free `.monotonic` atomic) on first access against `obj`,
         /// then reuses the cached `isize` byte offset on every subsequent call (~0.3 ns).
         pub inline fn getPtr(self: *Self, obj: objc.Object, ivar_name: [:0]const u8) ?*T {
             if (obj.value == null or obj.isTaggedPointer()) return null;
-            var off = @atomicLoad(isize, &self.offset, .unordered);
+            var off = @atomicLoad(isize, &self.offset, .monotonic);
             if (off == unresolved_offset) {
                 off = resolveSlow(&self.offset, obj, ivar_name) orelse return null;
             }

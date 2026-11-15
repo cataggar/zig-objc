@@ -55,6 +55,132 @@ pub fn NullablePtr(comptime P: type) type {
     };
 }
 
+fn containsType(comptime list: []const type, comptime T: type) bool {
+    for (list) |item| {
+        if (item == T) return true;
+    }
+    return false;
+}
+
+/// Validates that `T` is C-ABI compatible when placed behind a pointer (`*T`, `[*]T`,
+/// `[*c]T`, `?*T`), inside a fixed array (`[N]T`), or inside an `extern struct`/`extern union`.
+///
+/// Rejects 16-byte Zig optional handle structs (`?objc.Object`, `?objc.Class`, `?objc.Sel`,
+/// `?objc.Protocol`, `?BlockRef`, etc.), non-pointer optionals, slices, and `.auto` aggregates.
+pub fn validatePointeeOrElementCAbi(comptime T: type) void {
+    validatePointeeOrElementCAbiInner(T, &.{});
+}
+
+fn validatePointeeOrElementCAbiInner(comptime T: type, comptime visited: []const type) void {
+    if (WrapperUnderlying(T) != null or isBlockRefType(T)) return;
+
+    switch (@typeInfo(T)) {
+        .int, .float, .bool, .@"enum", .vector, .void, .@"opaque" => {},
+        .@"fn" => |fn_info| {
+            if (!std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c)) {
+                @compileError("C-ABI function pointer requires callconv(.c), got " ++ @typeName(T));
+            }
+            if (fn_info.return_type) |Ret| {
+                if (Ret != void) validateRawCAbiParamOrReturnInner(Ret, visited);
+            }
+            for (fn_info.param_types) |maybe_param| {
+                if (maybe_param) |P| validateRawCAbiParamOrReturnInner(P, visited);
+            }
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                @compileError("C-ABI pointer/array element cannot be Zig slice " ++ @typeName(T) ++ "; pass .ptr and .len");
+            }
+            validatePointeeOrElementCAbiInner(ptr.child, visited);
+        },
+        .array => |arr| {
+            validatePointeeOrElementCAbiInner(arr.child, visited);
+        },
+        .optional => |opt| {
+            if (WrapperUnderlying(opt.child) != null or isBlockRefType(opt.child) or
+                @typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice)
+            {
+                @compileError("pointer/array element " ++ @typeName(T) ++ " is a 16-byte Zig optional struct, not an 8-byte C pointer; for Objective-C out-parameters like id* / NSError**, use *objc.Object (initialized to .{ .value = null }) or *objc.c.id");
+            }
+            validatePointeeOrElementCAbiInner(@typeInfo(opt.child).pointer.child, visited);
+        },
+        .@"struct" => |s| {
+            if (s.layout == .auto) {
+                @compileError("C-ABI pointer/array element requires an extern or packed struct, got auto-layout struct " ++ @typeName(T) ++ "; pass *anyopaque or ?*anyopaque for opaque Zig pointers");
+            }
+            if (s.layout == .@"packed" and @bitSizeOf(T) > 128) {
+                @compileError("C-ABI call does not support packed struct larger than 128 bits: " ++ @typeName(T));
+            }
+            if (s.layout == .@"extern") {
+                if (containsType(visited, T)) return;
+                const next_visited = visited ++ &[_]type{T};
+                for (s.field_types) |FieldType| {
+                    validatePointeeOrElementCAbiInner(FieldType, next_visited);
+                }
+            }
+        },
+        .@"union" => |u| {
+            if (u.layout == .auto) {
+                @compileError("C-ABI pointer/array element requires an extern or packed union, got auto-layout union " ++ @typeName(T) ++ "; pass *anyopaque or ?*anyopaque for opaque Zig pointers");
+            }
+            if (u.layout == .@"packed" and @bitSizeOf(T) > 128) {
+                @compileError("C-ABI call does not support packed union larger than 128 bits: " ++ @typeName(T));
+            }
+            if (u.layout == .@"extern") {
+                if (containsType(visited, T)) return;
+                const next_visited = visited ++ &[_]type{T};
+                for (u.field_types) |FieldType| {
+                    validatePointeeOrElementCAbiInner(FieldType, next_visited);
+                }
+            }
+        },
+        else => @compileError("C-ABI pointer/array element does not support type " ++ @typeName(T)),
+    }
+}
+
+/// Validates a parameter or non-`void` return type of a raw `callconv(.c)` Objective-C `IMP`
+/// (which receives/returns raw C-ABI values directly without `abi.unwrapArg`/`abi.wrapReturn`).
+pub fn validateImpParamOrReturn(comptime T: type) void {
+    validateRawCAbiParamOrReturnInner(T, &.{});
+}
+
+fn validateRawCAbiParamOrReturnInner(comptime T: type, comptime visited: []const type) void {
+    if (WrapperUnderlying(T) != null or isBlockRefType(T)) return;
+
+    switch (@typeInfo(T)) {
+        .int, .float, .bool, .@"enum", .vector => {},
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                @compileError("Objective-C callconv(.c) IMP cannot accept/return Zig slice " ++ @typeName(T) ++ "; use a pointer + length");
+            }
+            validatePointeeOrElementCAbiInner(ptr.child, visited);
+        },
+        .optional => |opt| {
+            if (WrapperUnderlying(opt.child) != null or isBlockRefType(opt.child) or
+                @typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice)
+            {
+                @compileError("Objective-C callconv(.c) IMP cannot use 16-byte Zig optional struct " ++ @typeName(T) ++ "; use objc.Object, objc.c.id, objc.c.Class, objc.c.SEL, or ?*anyopaque instead");
+            }
+            validatePointeeOrElementCAbiInner(@typeInfo(opt.child).pointer.child, visited);
+        },
+        .@"struct", .@"union" => validatePointeeOrElementCAbiInner(T, visited),
+        else => @compileError("Objective-C callconv(.c) IMP does not support parameter/return type " ++ @typeName(T)),
+    }
+}
+
+fn PackedBackingInt(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .@"struct" => |s| s.backing_integer orelse @Int(.unsigned, @bitSizeOf(T)),
+        .@"union" => |u| blk: {
+            if (@hasField(@TypeOf(u), "backing_integer")) {
+                if (u.backing_integer) |B| break :blk B;
+            }
+            break :blk @Int(.unsigned, @bitSizeOf(T));
+        },
+        else => unreachable,
+    };
+}
+
 /// Maps `T` to its C-ABI parameter type when invoking Objective-C functions,
 /// `objc_msgSend`, `method_invoke`, or blocks.
 pub fn UnwrapParamType(comptime T: type, comptime convert_bool: bool) type {
@@ -68,6 +194,7 @@ pub fn UnwrapParamType(comptime T: type, comptime convert_bool: bool) type {
             if (ptr.size == .slice) {
                 @compileError("C-ABI call cannot pass Zig slice " ++ @typeName(T) ++ " directly; pass .ptr and .len");
             }
+            validatePointeeOrElementCAbi(ptr.child);
             return T;
         },
         .@"struct" => |s| {
@@ -76,6 +203,9 @@ pub fn UnwrapParamType(comptime T: type, comptime convert_bool: bool) type {
             }
             if (s.layout == .@"packed" and @bitSizeOf(T) > 128) {
                 @compileError("C-ABI call does not support packed struct larger than 128 bits: " ++ @typeName(T));
+            }
+            if (s.layout == .@"extern") {
+                validatePointeeOrElementCAbi(T);
             }
             return T;
         },
@@ -86,6 +216,9 @@ pub fn UnwrapParamType(comptime T: type, comptime convert_bool: bool) type {
             if (u.layout == .@"packed" and @bitSizeOf(T) > 128) {
                 @compileError("C-ABI call does not support packed union larger than 128 bits: " ++ @typeName(T));
             }
+            if (u.layout == .@"extern") {
+                validatePointeeOrElementCAbi(T);
+            }
             return T;
         },
         .optional => |opt| {
@@ -94,6 +227,7 @@ pub fn UnwrapParamType(comptime T: type, comptime convert_bool: bool) type {
             if (@typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice) {
                 @compileError("C-ABI optional must wrap a non-slice pointer, objc wrapper, or BlockRef, got " ++ @typeName(T));
             }
+            validatePointeeOrElementCAbi(@typeInfo(opt.child).pointer.child);
             return T;
         },
         .comptime_int => @compileError("C-ABI call cannot pass untyped comptime_int directly; cast with @as(T, value)"),
@@ -309,24 +443,35 @@ pub fn PromoteVarargType(comptime T: type) type {
             if (ptr.size == .slice) {
                 @compileError("C variadic call cannot pass Zig slice " ++ @typeName(T) ++ " directly; pass .ptr and .len or a [*:0]const u8 C string");
             }
+            validatePointeeOrElementCAbi(ptr.child);
             return T;
         },
         .@"struct" => |s| {
             if (s.layout == .auto) {
                 @compileError("C variadic call requires an extern or packed struct, got auto-layout struct " ++ @typeName(T));
             }
-            if (s.layout == .@"packed" and @bitSizeOf(T) > 128) {
-                @compileError("C variadic call does not support packed struct larger than 128 bits: " ++ @typeName(T));
+            if (s.layout == .@"packed") {
+                if (@bitSizeOf(T) > 128) {
+                    @compileError("C variadic call does not support packed struct larger than 128 bits: " ++ @typeName(T));
+                }
+                if (@bitSizeOf(T) < @bitSizeOf(c_int)) return c_int;
+                return T;
             }
+            validatePointeeOrElementCAbi(T);
             return T;
         },
         .@"union" => |u| {
             if (u.layout == .auto) {
                 @compileError("C variadic call requires an extern or packed union, got auto-layout union " ++ @typeName(T));
             }
-            if (u.layout == .@"packed" and @bitSizeOf(T) > 128) {
-                @compileError("C variadic call does not support packed union larger than 128 bits: " ++ @typeName(T));
+            if (u.layout == .@"packed") {
+                if (@bitSizeOf(T) > 128) {
+                    @compileError("C variadic call does not support packed union larger than 128 bits: " ++ @typeName(T));
+                }
+                if (@bitSizeOf(T) < @bitSizeOf(c_int)) return c_int;
+                return T;
             }
+            validatePointeeOrElementCAbi(T);
             return T;
         },
         .optional => |opt| {
@@ -335,6 +480,7 @@ pub fn PromoteVarargType(comptime T: type) type {
             if (@typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice) {
                 @compileError("C variadic optional must wrap a non-slice pointer, objc wrapper, or BlockRef, got " ++ @typeName(T));
             }
+            validatePointeeOrElementCAbi(@typeInfo(opt.child).pointer.child);
             return T;
         },
         .undefined => @compileError("C variadic call cannot pass untyped undefined directly; cast with @as(T, undefined)"),
@@ -377,6 +523,22 @@ pub inline fn promoteVararg(arg: anytype) PromoteVarargType(@TypeOf(arg)) {
         .@"enum" => |e| {
             if (comptime (@typeInfo(e.tag_type).int.bits < @typeInfo(c_int).int.bits)) {
                 return @intCast(@backingInt(arg));
+            }
+            return arg;
+        },
+        .@"struct" => |s| {
+            if (comptime (s.layout == .@"packed" and @bitSizeOf(T) < @bitSizeOf(c_int))) {
+                const Backing = PackedBackingInt(T);
+                const bits: Backing = @bitCast(arg);
+                return @intCast(bits);
+            }
+            return arg;
+        },
+        .@"union" => |u| {
+            if (comptime (u.layout == .@"packed" and @bitSizeOf(T) < @bitSizeOf(c_int))) {
+                const Backing = PackedBackingInt(T);
+                const bits: Backing = @bitCast(arg);
+                return @intCast(bits);
             }
             return arg;
         },
@@ -646,4 +808,33 @@ test "abi promoteVararg and buildVarargCallArgs with live Apple Silicon variadic
     const formatted = wrapReturn(objc.Object, @call(.auto, fn_ptr, call_args), true);
     const utf8 = std.mem.span(formatted.msgSend([*:0]const u8, "UTF8String", .{}));
     try testing.expectEqualStrings("tag:42:1.5:obj:1", utf8);
+
+    // Narrow (< 32-bit) packed struct and packed union default integer promotions
+    const PackedU8 = packed struct(u8) { lo: u4, hi: u4 };
+    const PackedI8 = packed struct(i8) { lo: u4, hi: i4 };
+    const PackedU32 = packed struct(u32) { lo: u16, hi: u16 };
+    const PackedUnion8 = packed union { raw: u8, parts: PackedU8 };
+    const PackedUnion32 = packed union { raw: u32, parts: PackedU32 };
+
+    try testing.expectEqual(c_int, PromoteVarargType(PackedU8));
+    try testing.expectEqual(c_int, PromoteVarargType(PackedI8));
+    try testing.expectEqual(PackedU32, PromoteVarargType(PackedU32));
+    try testing.expectEqual(c_int, PromoteVarargType(PackedUnion8));
+    try testing.expectEqual(PackedUnion32, PromoteVarargType(PackedUnion32));
+
+    const pu8: PackedU8 = .{ .lo = 0xA, .hi = 0xB };
+    const pi8: PackedI8 = @bitCast(@as(i8, -5));
+    const punion8: PackedUnion8 = .{ .raw = 0xCD };
+    try testing.expectEqual(@as(c_int, 0xBA), promoteVararg(pu8));
+    try testing.expectEqual(@as(c_int, -5), promoteVararg(pi8));
+    try testing.expectEqual(@as(c_int, 0xCD), promoteVararg(punion8));
+
+    // Self-referential extern struct pointer cycle protection in validatePointeeOrElementCAbi
+    const SelfRefNode = extern struct {
+        const Self = @This();
+        next: ?*Self,
+        out_obj: *objc.Object,
+    };
+    try testing.expectEqual(*SelfRefNode, UnwrapParamType(*SelfRefNode, true));
+    try testing.expectEqual(?*SelfRefNode, UnwrapParamType(?*SelfRefNode, true));
 }

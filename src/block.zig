@@ -504,15 +504,44 @@ fn validateCaptures(comptime Captures: type) void {
     if (info.is_tuple) {
         @compileError("Block Captures must be a named-field struct (use struct {} for no captures), got tuple " ++ @typeName(Captures));
     }
-    for (info.field_names, info.field_types) |field_name, field_type| {
+    for (info.field_names, info.field_types, info.field_attrs) |field_name, field_type, field_attr| {
         if (std.mem.eql(u8, field_name, "__zig_objc_user_invoke")) {
             @compileError("Block capture field name '__zig_objc_user_invoke' is reserved");
+        }
+        const natural_align = if (@sizeOf(field_type) == 0) 1 else @alignOf(field_type);
+        const explicit_align: usize = if (@typeInfo(@TypeOf(field_attr.@"align")) == .optional)
+            (field_attr.@"align" orelse natural_align)
+        else
+            field_attr.@"align";
+        if (@max(natural_align, explicit_align) > 16) {
+            @compileError("Block captures cannot have alignment > 16 bytes because macOS _Block_copy uses 16-byte malloc alignment; capture a 16-byte aligned pointer instead");
         }
         validateCaptureFieldType(field_type, false);
     }
 }
 
-fn validateCaptureFieldType(comptime T: type, comptime in_array: bool) void {
+fn validateCapturePointerTarget(comptime Pointee: type) void {
+    switch (@typeInfo(Pointee)) {
+        .optional => |opt| {
+            if (abi.WrapperUnderlying(opt.child) != null or abi.isBlockRefType(opt.child) or
+                @typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice)
+            {
+                @compileError("pointer/array element " ++ @typeName(Pointee) ++ " is a 16-byte Zig optional struct, not an 8-byte C pointer; for Objective-C out-parameters like id* / NSError**, use *objc.Object (initialized to .{ .value = null }) or *objc.c.id");
+            }
+            validateCapturePointerTarget(@typeInfo(opt.child).pointer.child);
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                @compileError("C-ABI pointer/array element cannot be Zig slice " ++ @typeName(Pointee) ++ "; pass .ptr and .len");
+            }
+            validateCapturePointerTarget(ptr.child);
+        },
+        .array => |arr| validateCapturePointerTarget(arr.child),
+        else => {},
+    }
+}
+
+fn validateCaptureFieldType(comptime T: type, comptime nested_aggregate: bool) void {
     if (abi.isBlockContextStruct(T)) {
         @compileError("Block captures cannot store a Block.Context by value; capture *const Block.Context, BlockRef, or objc.Object instead");
     }
@@ -525,8 +554,11 @@ fn validateCaptureFieldType(comptime T: type, comptime in_array: bool) void {
     if (T == comptime_float) {
         @compileError("Block capture cannot have type comptime_float; cast to a concrete float type with @as");
     }
-    if (in_array and classifyCaptureType(T) != .plain) {
-        @compileError("Block captures cannot store ARC-managed objects or blocks inside a fixed array (" ++ @typeName(T) ++ "); capture individual fields or a pointer instead");
+    if (@sizeOf(T) > 0 and @alignOf(T) > 16) {
+        @compileError("Block captures cannot have alignment > 16 bytes because macOS _Block_copy uses 16-byte malloc alignment; capture a 16-byte aligned pointer instead");
+    }
+    if (nested_aggregate and classifyCaptureType(T) != .plain) {
+        @compileError("Block captures cannot store ARC-managed objects or blocks inside a nested array, struct, or union (" ++ @typeName(T) ++ "); capture individual fields or a pointer instead");
     }
     if (abi.WrapperUnderlying(T) != null or abi.isBlockRefType(T)) return;
 
@@ -537,15 +569,42 @@ fn validateCaptureFieldType(comptime T: type, comptime in_array: bool) void {
             if (ptr.size == .slice) {
                 @compileError("Block captures cannot store Zig slice " ++ @typeName(T) ++ " by value; capture a pointer or separate .ptr and .len fields instead");
             }
+            validateCapturePointerTarget(ptr.child);
         },
         .@"struct" => |s| {
             if (s.layout == .auto) {
                 @compileError("Block captures cannot store auto-layout struct " ++ @typeName(T) ++ " by value; use an extern struct or capture *" ++ @typeName(T) ++ " instead");
             }
+            for (s.field_types, s.field_attrs) |FieldType, field_attr| {
+                if (s.layout == .@"extern") {
+                    const nat = if (@sizeOf(FieldType) == 0) 1 else @alignOf(FieldType);
+                    const exp: usize = if (@typeInfo(@TypeOf(field_attr.@"align")) == .optional)
+                        (field_attr.@"align" orelse nat)
+                    else
+                        field_attr.@"align";
+                    if (@max(nat, exp) > 16) {
+                        @compileError("Block captures cannot have alignment > 16 bytes because macOS _Block_copy uses 16-byte malloc alignment; capture a 16-byte aligned pointer instead");
+                    }
+                }
+                validateCaptureFieldType(FieldType, true);
+            }
         },
         .@"union" => |u| {
             if (u.layout == .auto) {
                 @compileError("Block captures cannot store auto-layout union " ++ @typeName(T) ++ " by value; use an extern union or capture *" ++ @typeName(T) ++ " instead");
+            }
+            for (u.field_types, u.field_attrs) |FieldType, field_attr| {
+                if (u.layout == .@"extern") {
+                    const nat = if (@sizeOf(FieldType) == 0) 1 else @alignOf(FieldType);
+                    const exp: usize = if (@typeInfo(@TypeOf(field_attr.@"align")) == .optional)
+                        (field_attr.@"align" orelse nat)
+                    else
+                        field_attr.@"align";
+                    if (@max(nat, exp) > 16) {
+                        @compileError("Block captures cannot have alignment > 16 bytes because macOS _Block_copy uses 16-byte malloc alignment; capture a 16-byte aligned pointer instead");
+                    }
+                }
+                validateCaptureFieldType(FieldType, true);
             }
         },
         .optional => |opt| {
@@ -559,6 +618,7 @@ fn validateCaptureFieldType(comptime T: type, comptime in_array: bool) void {
             if (@typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice) {
                 @compileError("Block captures cannot store non-pointer optional " ++ @typeName(T) ++ " by value; capture a pointer or separate flag and value fields instead");
             }
+            validateCapturePointerTarget(@typeInfo(opt.child).pointer.child);
         },
         else => @compileError("Block captures do not support type " ++ @typeName(T) ++ "; capture a pointer or extern-compatible type instead"),
     }
@@ -1576,6 +1636,31 @@ test "BlockRef.tryCopy, bool descriptor encoding, and extern Object/Sel signatur
     }).echo);
     try testing.expect(SelEchoBlock.invoke(sel_echo, .{ suffix, length_sel }).isEqual(length_sel));
     try testing.expect(SelEchoBlock.asBlockRef(sel_echo).invoke(.{ suffix, desc_sel }).isEqual(desc_sel));
+
+    // Verify 16-byte aligned field and nested POD extern struct captures work cleanly
+    const NestedPod = extern struct {
+        scale: f32,
+        bias: f32,
+        sel_handle: objc.Sel,
+    };
+    const SimdPodBlock = Block(struct {
+        lanes: [4]f32 align(16),
+        pod: NestedPod,
+    }, .{f32}, f32);
+    var simd_stack = SimdPodBlock.init(.{
+        .lanes = .{ 1.0, 2.0, 3.0, 4.0 },
+        .pod = .{ .scale = 2.0, .bias = 0.5, .sel_handle = length_sel },
+    }, &(struct {
+        fn run(ctx: *const SimdPodBlock.Context, x: f32) callconv(.c) f32 {
+            const caps = SimdPodBlock.getCaptures(ctx);
+            const sum = caps.lanes[0] + caps.lanes[1] + caps.lanes[2] + caps.lanes[3];
+            return sum * caps.pod.scale + caps.pod.bias + x;
+        }
+    }).run);
+    const simd_heap = try SimdPodBlock.copy(&simd_stack);
+    defer SimdPodBlock.release(simd_heap);
+    try testing.expectEqual(@as(usize, 0), @intFromPtr(&simd_heap.lanes) % 16);
+    try testing.expectEqual(@as(f32, 22.0), SimdPodBlock.invoke(simd_heap, .{@as(f32, 1.5)}));
 }
 
 test {

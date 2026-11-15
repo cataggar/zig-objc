@@ -11,19 +11,19 @@ pub inline fn sel(name: [:0]const u8) Sel {
 pub const Sel = extern struct {
     value: c.SEL,
 
-    /// Looks up and caches `name` in a lock-free atomic static slot per comptime
-    /// selector string (`sel_registerName` runs once on first call).
+    /// Looks up and caches `name` in a lock-free `.acquire`/`.release` atomic static slot
+    /// per comptime selector string (`sel_registerName` runs once on first call).
     pub inline fn cached(comptime name: [:0]const u8) Sel {
         const Cache = struct {
             var slot: c.SEL = null;
             noinline fn resolve() Sel {
                 @branchHint(.unlikely);
                 const resolved = c.sel_registerName(name.ptr);
-                @atomicStore(c.SEL, &slot, resolved, .unordered);
+                @atomicStore(c.SEL, &slot, resolved, .release);
                 return .{ .value = resolved };
             }
         };
-        if (@atomicLoad(c.SEL, &Cache.slot, .unordered)) |ptr| {
+        if (@atomicLoad(c.SEL, &Cache.slot, .acquire)) |ptr| {
             return .{ .value = ptr };
         }
         return Cache.resolve();

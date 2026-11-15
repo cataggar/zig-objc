@@ -45,7 +45,7 @@ fn WeakExternReturn(comptime FnOrOptPtr: type) type {
 /// emitting a strong undefined Mach-O reference when targeting older Apple OS
 /// deployment versions against a newer SDK.
 ///
-/// Caches the resolved pointer in a lock-free `.unordered` atomic static slot per
+/// Caches the resolved pointer in a lock-free `.monotonic` atomic static slot per
 /// `(Fn, symbol_name)` instantiation using a private sentinel address to distinguish
 /// "unresolved" from "resolved to `null`".
 pub inline fn weakExtern(comptime Fn: type, comptime symbol_name: []const u8) WeakExternReturn(Fn) {
@@ -68,13 +68,13 @@ pub inline fn weakExtern(comptime Fn: type, comptime symbol_name: []const u8) We
                 ?*const anyopaque,
                 &slot,
                 if (sym) |f| @ptrCast(f) else null,
-                .unordered,
+                .monotonic,
             );
             return sym;
         }
     };
 
-    const cached = @atomicLoad(?*const anyopaque, &Cache.slot, .unordered);
+    const cached = @atomicLoad(?*const anyopaque, &Cache.slot, .monotonic);
     if (cached != @as(?*const anyopaque, @ptrCast(&Cache.unresolved_sentinel))) {
         const NonNullFn = @typeInfo(OptFn).optional.child;
         return if (cached) |p| @as(NonNullFn, @ptrCast(@alignCast(p))) else null;
@@ -287,10 +287,18 @@ fn classifyX86_64AggregateWithSimd(
 
         // SysV AMD64 ABI §3.2.3 post-merger cleanup (Rule 5):
         // (a) If one of the classes is MEMORY, the whole argument is passed in memory.
-        // (b) If X87UP is not preceded by X87, the whole argument is passed in memory.
+        // (b) If X87UP is not preceded by X87, SysV ELF passes the whole aggregate in
+        //     memory, whereas Darwin x86_64 (`X86_64ABIInfo::postMerge`) reclassifies
+        //     standalone X87UP to SSE (returning `{ i64, double }` via `objc_msgSend`).
         for (classes[0..num_eightbytes], 0..) |cls, i| {
             if (cls == .memory) break :blk .memory;
-            if (cls == .x87up and (i == 0 or classes[i - 1] != .x87)) break :blk .memory;
+            if (cls == .x87up and (i == 0 or classes[i - 1] != .x87)) {
+                if (builtin.target.os.tag.isDarwin()) {
+                    classes[i] = .sse;
+                } else {
+                    break :blk .memory;
+                }
+            }
         }
 
         // (c) If the size of the aggregate exceeds two eightbytes and the first
@@ -403,6 +411,116 @@ pub fn usesFpret(comptime T: type) bool {
     return comptime (builtin.target.cpu.arch == .x86_64 and x86_64UsesFpret(T));
 }
 
+const Aarch64HomogeneousInfo = struct {
+    base: type,
+    count: usize,
+};
+
+fn aapcs64HomogeneousInfo(comptime T: type) ?Aarch64HomogeneousInfo {
+    return comptime switch (@typeInfo(T)) {
+        .float => |f| switch (f.bits) {
+            16 => .{ .base = f16, .count = 1 },
+            32 => .{ .base = f32, .count = 1 },
+            64 => .{ .base = f64, .count = 1 },
+            else => null,
+        },
+        .vector => if (@sizeOf(T) == 8 or @sizeOf(T) == 16)
+            .{ .base = T, .count = 1 }
+        else
+            null,
+        .array => |arr| blk: {
+            if (arr.len == 0) break :blk .{ .base = void, .count = 0 };
+            const sub = aapcs64HomogeneousInfo(arr.child) orelse break :blk null;
+            if (sub.count == 0) break :blk .{ .base = void, .count = 0 };
+            const total = sub.count * arr.len;
+            if (total > 4) break :blk null;
+            if (@sizeOf(T) != total * @sizeOf(sub.base)) break :blk null;
+            break :blk .{ .base = sub.base, .count = total };
+        },
+        .@"struct" => |s| blk: {
+            if (s.layout != .@"extern") break :blk null;
+            if (@sizeOf(T) == 0) break :blk .{ .base = void, .count = 0 };
+            if (hasUnalignedFields(T, 0)) break :blk null;
+
+            var base: ?type = null;
+            var count: usize = 0;
+            for (s.field_types) |FieldType| {
+                const sub = aapcs64HomogeneousInfo(FieldType) orelse break :blk null;
+                if (sub.count == 0) continue;
+                if (base) |existing| {
+                    if (existing != sub.base) break :blk null;
+                } else {
+                    base = sub.base;
+                }
+                count += sub.count;
+                if (count > 4) break :blk null;
+            }
+            const resolved_base = base orelse break :blk null;
+            if (count == 0 or @sizeOf(T) != count * @sizeOf(resolved_base)) break :blk null;
+            break :blk .{ .base = resolved_base, .count = count };
+        },
+        .@"union" => |u| blk: {
+            if (u.layout != .@"extern") break :blk null;
+            if (@sizeOf(T) == 0) break :blk .{ .base = void, .count = 0 };
+            if (hasUnalignedFields(T, 0)) break :blk null;
+
+            var base: ?type = null;
+            var max_count: usize = 0;
+            for (u.field_types) |FieldType| {
+                const sub = aapcs64HomogeneousInfo(FieldType) orelse break :blk null;
+                if (sub.count == 0) continue;
+                if (base) |existing| {
+                    if (existing != sub.base) break :blk null;
+                } else {
+                    base = sub.base;
+                }
+                if (sub.count > max_count) max_count = sub.count;
+            }
+            const resolved_base = base orelse break :blk null;
+            if (max_count == 0 or max_count > 4) break :blk null;
+            if (@sizeOf(T) != max_count * @sizeOf(resolved_base)) break :blk null;
+            break :blk .{ .base = resolved_base, .count = max_count };
+        },
+        else => null,
+    };
+}
+
+/// Reports whether `T` is an AAPCS64 Homogeneous Floating-Point Aggregate (HFA:
+/// 1..4 elements all of the exact same `f16`, `f32`, or `f64` scalar type) or
+/// Homogeneous Short-Vector Aggregate (HVA: 1..4 elements all of the exact same
+/// 8-byte or 16-byte short-vector type), returned in `v0`..`v3` on `aarch64`.
+///
+/// Independent of the current compilation host architecture so unit tests on
+/// any target can verify AAPCS64 HFA/HVA classification.
+pub fn isAarch64HfaOrHva(comptime T: type) bool {
+    return comptime switch (@typeInfo(T)) {
+        .@"struct", .@"union" => blk: {
+            const info = aapcs64HomogeneousInfo(T) orelse break :blk false;
+            break :blk info.count >= 1 and info.count <= 4 and info.base != void;
+        },
+        else => false,
+    };
+}
+
+/// Reports whether C-ABI return type `Return` is returned indirectly via a
+/// caller-allocated hidden buffer (`x8` on `aarch64`, `%rdi` `stret` on `x86_64`).
+///
+/// Objective-C's `objc_msgSend` (`aarch64`) and `objc_msgSend_stret` (`x86_64`)
+/// do NOT zero caller-allocated indirect-return buffers when `receiver == nil`,
+/// so `msgSend` / `msgSendVarargs` must zero-return manually on `nil` receivers.
+pub fn usesIndirectReturn(comptime Return: type) bool {
+    if (Return == void) return false;
+    return comptime switch (builtin.target.cpu.arch) {
+        .x86_64 => usesStret(Return),
+        .aarch64 => switch (@typeInfo(Return)) {
+            .vector => @sizeOf(Return) > 16,
+            .@"struct", .@"union" => @sizeOf(Return) > 16 and !isAarch64HfaOrHva(Return),
+            else => false,
+        },
+        else => @sizeOf(Return) > 2 * @sizeOf(usize),
+    };
+}
+
 test "NSObjCRuntime integer types and limits" {
     const testing = std.testing;
     try testing.expectEqual(@sizeOf(*anyopaque), @sizeOf(NSInteger));
@@ -457,7 +575,15 @@ test "x86_64 SysV ABI stret and fpret classification" {
     try testing.expect(!x86_64AggregateUsesStret(NestedLongDoubleStruct));
     try testing.expect(x86_64AggregateUsesStret(LongDoublePlusByte));
     try testing.expect(x86_64AggregateUsesStret(MixedLongDoubleFloatUnion));
-    try testing.expect(x86_64AggregateUsesStret(MixedLongDoubleIntUnion));
+    try testing.expectEqual(
+        !builtin.target.os.tag.isDarwin() and @sizeOf(c_longdouble) > 8,
+        x86_64AggregateUsesStret(MixedLongDoubleIntUnion),
+    );
+    if (builtin.target.cpu.arch == .x86_64) {
+        const MixedF80IntUnion = extern union { ld: f80, u: u64 };
+        try testing.expectEqual(!builtin.target.os.tag.isDarwin(), x86_64AggregateUsesStret(MixedF80IntUnion));
+        try testing.expect(!x86_64UsesFpret(MixedF80IntUnion));
+    }
 
     // fpret classification
     try testing.expect(!x86_64UsesFpret(f32));
@@ -493,6 +619,49 @@ test "x86_64 SysV ABI stret and fpret classification" {
         try testing.expect(!usesStret(TailPacked9));
         try testing.expect(usesFpret(c_longdouble));
         try testing.expect(usesFpret(LongDoubleStruct));
+    }
+}
+
+test "AAPCS64 HFA/HVA and usesIndirectReturn classification" {
+    const testing = std.testing;
+
+    const NSPoint = extern struct { x: f64, y: f64 };
+    const NSSize = extern struct { width: f64, height: f64 };
+    const NSRect = extern struct { origin: NSPoint, size: NSSize };
+    const CGAffineTransform = extern struct { a: f64, b: f64, c: f64, d: f64, tx: f64, ty: f64 };
+    const BigInts = extern struct { a: u64, b: u64, c: u64, d: u64 };
+    const Float3 = extern struct { arr: [3]f32 };
+    const MixedFloat = extern struct { a: f32, b: f64 };
+    const PaddedFloat3 = extern struct { a: f32 align(16), b: f32, c: f32 };
+    const HfaUnion = extern union { vec: [4]f64, pair: NSPoint };
+
+    try testing.expect(isAarch64HfaOrHva(NSPoint));
+    try testing.expect(isAarch64HfaOrHva(NSRect));
+    try testing.expect(isAarch64HfaOrHva(Float3));
+    try testing.expect(isAarch64HfaOrHva(HfaUnion));
+    try testing.expect(!isAarch64HfaOrHva(f64));
+    try testing.expect(!isAarch64HfaOrHva(@Vector(4, f32)));
+    try testing.expect(!isAarch64HfaOrHva(CGAffineTransform));
+    try testing.expect(!isAarch64HfaOrHva(BigInts));
+    try testing.expect(!isAarch64HfaOrHva(MixedFloat));
+    try testing.expect(!isAarch64HfaOrHva(PaddedFloat3));
+
+    try testing.expect(!usesIndirectReturn(void));
+    try testing.expect(!usesIndirectReturn(u64));
+    try testing.expect(!usesIndirectReturn(NSPoint));
+    try testing.expect(usesIndirectReturn(CGAffineTransform));
+    try testing.expect(usesIndirectReturn(BigInts));
+
+    if (builtin.target.cpu.arch == .aarch64) {
+        try testing.expect(!usesIndirectReturn(NSRect));
+        try testing.expect(!usesIndirectReturn(HfaUnion));
+        try testing.expect(!usesIndirectReturn(@Vector(4, f32)));
+        try testing.expect(usesIndirectReturn(@Vector(8, f32)));
+    } else if (builtin.target.cpu.arch == .x86_64) {
+        try testing.expect(usesIndirectReturn(NSRect));
+        try testing.expect(usesIndirectReturn(HfaUnion));
+        try testing.expect(!usesIndirectReturn(@Vector(4, f32)));
+        try testing.expect(!usesIndirectReturn(@Vector(8, f32)));
     }
 }
 

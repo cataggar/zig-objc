@@ -123,6 +123,11 @@ pub const Method = extern struct {
         const invoke_fn = comptime methodInvokePtr(RealReturn);
         const invoke_ptr: *const Fn = @ptrCast(@alignCast(invoke_fn));
         const call_args = abi.buildCallArgs(.{ target_val, self.value }, args, true);
+        const target_can_be_null = @typeInfo(Target) == .optional or
+            (@typeInfo(Target) == .pointer and @typeInfo(Target).pointer.size == .c);
+        if (comptime (cpkg.usesIndirectReturn(RealReturn) and target_can_be_null)) {
+            if (target_val == null) return abi.wrapReturn(Return, std.mem.zeroes(RealReturn), true);
+        }
         const result = @call(.auto, invoke_ptr, call_args);
         return abi.wrapReturn(Return, result, true);
     }

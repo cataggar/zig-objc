@@ -72,6 +72,11 @@ pub fn MsgSend(comptime T: type) type {
             const msg_send_ptr: *const Fn = @ptrCast(@alignCast(msg_send_fn));
 
             const call_args = abi.buildCallArgs(.{ target_id, sel.value }, args, true);
+            const target_can_be_null = @typeInfo(@TypeOf(target_id)) == .optional or
+                (@typeInfo(@TypeOf(target_id)) == .pointer and @typeInfo(@TypeOf(target_id)).pointer.size == .c);
+            if (comptime (cpkg.usesIndirectReturn(RealReturn) and target_can_be_null)) {
+                if (target_id == null) return abi.wrapReturn(Return, std.mem.zeroes(RealReturn), true);
+            }
             const result = @call(.auto, msg_send_ptr, call_args);
 
             return abi.wrapReturn(Return, result, true);
@@ -96,6 +101,11 @@ pub fn MsgSend(comptime T: type) type {
             var super = initSuper(target_id, superclass);
 
             const call_args = abi.buildCallArgs(.{ &super, sel.value }, args, true);
+            const target_can_be_null = @typeInfo(@TypeOf(target_id)) == .optional or
+                (@typeInfo(@TypeOf(target_id)) == .pointer and @typeInfo(@TypeOf(target_id)).pointer.size == .c);
+            if (comptime (cpkg.usesIndirectReturn(RealReturn) and target_can_be_null)) {
+                if (target_id == null) return abi.wrapReturn(Return, std.mem.zeroes(RealReturn), true);
+            }
             const result = @call(.auto, msg_send_ptr, call_args);
 
             return abi.wrapReturn(Return, result, true);
@@ -124,6 +134,11 @@ pub fn MsgSend(comptime T: type) type {
             const msg_send_ptr: *const Fn = @ptrCast(@alignCast(msg_send_fn));
 
             const call_args = abi.buildVarargCallArgs(.{ target_id, sel.value }, fixed_args, var_args);
+            const target_can_be_null = @typeInfo(@TypeOf(target_id)) == .optional or
+                (@typeInfo(@TypeOf(target_id)) == .pointer and @typeInfo(@TypeOf(target_id)).pointer.size == .c);
+            if (comptime (cpkg.usesIndirectReturn(RealReturn) and target_can_be_null)) {
+                if (target_id == null) return abi.wrapReturn(Return, std.mem.zeroes(RealReturn), true);
+            }
             const result = @call(.auto, msg_send_ptr, call_args);
 
             return abi.wrapReturn(Return, result, true);
@@ -153,6 +168,11 @@ pub fn MsgSend(comptime T: type) type {
             var super = initSuper(target_id, superclass);
 
             const call_args = abi.buildVarargCallArgs(.{ &super, sel.value }, fixed_args, var_args);
+            const target_can_be_null = @typeInfo(@TypeOf(target_id)) == .optional or
+                (@typeInfo(@TypeOf(target_id)) == .pointer and @typeInfo(@TypeOf(target_id)).pointer.size == .c);
+            if (comptime (cpkg.usesIndirectReturn(RealReturn) and target_can_be_null)) {
+                if (target_id == null) return abi.wrapReturn(Return, std.mem.zeroes(RealReturn), true);
+            }
             const result = @call(.auto, msg_send_ptr, call_args);
 
             return abi.wrapReturn(Return, result, true);
@@ -1073,4 +1093,185 @@ test "msgSendVarargs and msgSendSuperVarargs with Foundation variadic selectors"
     try testing.expectEqual(@as(usize, 2), super_arr.msgSend(usize, "count", .{}));
     try testing.expectEqual(@as(c_int, 10), super_arr.msgSend(objc.Object, "objectAtIndex:", .{@as(usize, 0)}).msgSend(c_int, "intValue", .{}));
     try testing.expectEqual(@as(c_int, 30), super_arr.msgSend(objc.Object, "objectAtIndex:", .{@as(usize, 1)}).msgSend(c_int, "intValue", .{}));
+}
+
+test "nil receiver zero-initializes indirect-return (sret) aggregates and preserves arg side effects" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const BigInts = extern struct {
+        a: u64,
+        b: u64,
+        c: u64,
+        d: u64,
+    };
+    const CGAffineTransform = extern struct {
+        a: f64,
+        b: f64,
+        c: f64,
+        d: f64,
+        tx: f64,
+        ty: f64,
+    };
+
+    try testing.expect(cpkg.usesIndirectReturn(BigInts));
+    try testing.expect(cpkg.usesIndirectReturn(CGAffineTransform));
+
+    const Helpers = struct {
+        noinline fn dirtyStack() void {
+            var poison: [256]u64 = @splat(0xDEAD_BEEF_CAFE_BABE);
+            std.mem.doNotOptimizeAway(&poison);
+        }
+
+        noinline fn sendNilBigInts(nil_obj: objc.Object, counter: *usize) BigInts {
+            return nil_obj.msgSend(BigInts, "anything:", .{blk: {
+                counter.* += 1;
+                break :blk @as(i32, 7);
+            }});
+        }
+
+        noinline fn sendNilVarargsBigInts(nil_obj: objc.Object, counter: *usize) BigInts {
+            return nil_obj.msgSendVarargs(
+                BigInts,
+                "anything:",
+                .{blk: {
+                    counter.* += 10;
+                    break :blk @as(i32, 1);
+                }},
+                .{blk: {
+                    counter.* += 100;
+                    break :blk @as(i32, 2);
+                }},
+            );
+        }
+
+        noinline fn sendNilAffine(nil_obj: objc.Object) CGAffineTransform {
+            return nil_obj.msgSend(CGAffineTransform, "anything", .{});
+        }
+    };
+
+    const nil_obj: objc.Object = .{ .value = null };
+    var side_effects: usize = 0;
+
+    Helpers.dirtyStack();
+    const res1 = Helpers.sendNilBigInts(nil_obj, &side_effects);
+    try testing.expectEqual(BigInts{ .a = 0, .b = 0, .c = 0, .d = 0 }, res1);
+    try testing.expectEqual(@as(usize, 1), side_effects);
+
+    Helpers.dirtyStack();
+    const res2 = Helpers.sendNilVarargsBigInts(nil_obj, &side_effects);
+    try testing.expectEqual(BigInts{ .a = 0, .b = 0, .c = 0, .d = 0 }, res2);
+    try testing.expectEqual(@as(usize, 111), side_effects);
+
+    Helpers.dirtyStack();
+    const res3 = Helpers.sendNilAffine(nil_obj);
+    try testing.expectEqual(
+        CGAffineTransform{ .a = 0, .b = 0, .c = 0, .d = 0, .tx = 0, .ty = 0 },
+        res3,
+    );
+}
+
+test "msgSendVarargs promotes narrow (< 32-bit) packed struct and packed union arguments" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const PackedU8 = packed struct(u8) { lo: u4, hi: u4 };
+    const PackedI8 = packed struct(i8) { lo: u4, hi: i4 };
+    const PackedUnion8 = packed union { raw: u8, nibbles: PackedU8 };
+
+    const NSString = objc.getClass("NSString").?;
+    const fmt = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"%d:%d:%d"});
+
+    const pu8: PackedU8 = .{ .lo = 0x5, .hi = 0xA }; // 0xA5 = 165
+    const pi8: PackedI8 = @bitCast(@as(i8, -9));
+    const punion: PackedUnion8 = .{ .raw = 200 };
+
+    const formatted = msgSendVarargs(
+        NSString,
+        objc.Object,
+        "stringWithFormat:",
+        .{fmt},
+        .{ pu8, pi8, punion },
+    );
+    try testing.expectEqualStrings(
+        "165:-9:200",
+        std.mem.span(formatted.msgSend([*:0]const u8, "UTF8String", .{})),
+    );
+}
+
+test "idiomatic NSError** out-parameter pattern using *objc.Object" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSObject = objc.getClass("NSObject").?;
+    const NSString = objc.getClass("NSString").?;
+
+    const ErrClass = objc.allocateClassPair(NSObject, "ZigObjcSafeOutErrorTest").?;
+    defer objc.disposeClassPair(ErrClass);
+
+    const impls = struct {
+        fn performOperation(
+            _: objc.Object,
+            _: objc.Sel,
+            should_fail: c.BOOL,
+            out_err: ?*objc.Object,
+        ) callconv(.c) c.BOOL {
+            if (cpkg.boolResult(should_fail)) {
+                if (out_err) |err_slot| {
+                    const domain = objc.getClass("NSString").?.msgSend(
+                        objc.Object,
+                        "stringWithUTF8String:",
+                        .{"com.zig-objc.test"},
+                    );
+                    err_slot.* = objc.getClass("NSError").?.msgSend(
+                        objc.Object,
+                        "errorWithDomain:code:userInfo:",
+                        .{ domain, @as(objc.NSInteger, 404), @as(?objc.Object, null) },
+                    );
+                }
+                return cpkg.boolParam(false);
+            }
+            return cpkg.boolParam(true);
+        }
+    };
+    try testing.expect(ErrClass.addMethod("performOperation:error:", impls.performOperation));
+    objc.registerClassPair(ErrClass);
+
+    const inst = objc.allocInit(ErrClass).?;
+    defer inst.release();
+
+    // 1. Success path: `err.value` remains `null`
+    var err: objc.Object = .{ .value = null };
+    try testing.expect(inst.msgSend(bool, "performOperation:error:", .{ false, &err }));
+    try testing.expect(err.value == null);
+
+    // 2. Failure path: `err` is populated cleanly with the 8-byte `NSError *`
+    try testing.expect(!inst.msgSend(bool, "performOperation:error:", .{ true, &err }));
+    try testing.expect(err.value != null);
+    try testing.expectEqual(@as(objc.NSInteger, 404), err.msgSend(objc.NSInteger, "code", .{}));
+    const domain = err.msgSend(objc.Object, "domain", .{});
+    try testing.expectEqualStrings(
+        "com.zig-objc.test",
+        std.mem.span(domain.msgSend([*:0]const u8, "UTF8String", .{})),
+    );
+
+    // 3. Real Foundation NSError** selector (`+[NSString stringWithContentsOfFile:encoding:error:]`)
+    var cocoa_err: objc.Object = .{ .value = null };
+    const missing_path = NSString.msgSend(
+        objc.Object,
+        "stringWithUTF8String:",
+        .{"/nonexistent-zig-objc-path-9f8e7d6c5b4a/missing.txt"},
+    );
+    const ns_utf8_encoding: objc.NSUInteger = 4;
+    const contents = NSString.msgSend(
+        ?objc.Object,
+        "stringWithContentsOfFile:encoding:error:",
+        .{ missing_path, ns_utf8_encoding, &cocoa_err },
+    );
+    try testing.expect(contents == null);
+    try testing.expect(cocoa_err.value != null);
+    try testing.expect(cocoa_err.msgSend(objc.NSInteger, "code", .{}) != 0);
 }

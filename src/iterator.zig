@@ -23,7 +23,12 @@ pub const Iterator = struct {
     exhausted: bool = false,
     // Clang compiles `for…in` loops with a size 16 buffer.
     buffer: [16]objc.c.id = @splat(null),
-    slice: []const objc.c.id = &.{},
+    batch_index: usize = 0,
+    batch_len: usize = 0,
+    uses_internal_buffer: bool = false,
+    mutations_self_offset: u8 = no_self_offset,
+
+    const no_self_offset: u8 = std.math.maxInt(u8);
 
     pub inline fn init(object: objc.Object) Iterator {
         return .{
@@ -33,7 +38,7 @@ pub const Iterator = struct {
     }
 
     pub inline fn next(self: *Iterator) ?objc.Object {
-        if (self.slice.len == 0) {
+        if (self.batch_index >= self.batch_len) {
             if (self.exhausted) return null;
 
             const count = self.object.msgSend(c_ulong, self.sel, .{
@@ -45,28 +50,47 @@ pub const Iterator = struct {
                 self.exhausted = true;
                 return null;
             }
-            if (!self.has_started) {
-                self.has_started = true;
-                if (self.state.mutationsPtr) |mp| {
+            const state_addr = @intFromPtr(&self.state);
+            if (self.state.mutationsPtr) |mp| {
+                const mp_addr = @intFromPtr(mp);
+                if (mp_addr >= state_addr and mp_addr < state_addr + @sizeOf(NSFastEnumerationState)) {
+                    self.mutations_self_offset = @intCast(mp_addr - state_addr);
+                } else {
+                    self.mutations_self_offset = no_self_offset;
+                }
+                if (!self.has_started) {
                     self.start_mutation = mp.*;
                 }
+            } else {
+                self.mutations_self_offset = no_self_offset;
             }
+            self.has_started = true;
             const items = self.state.itemsPtr orelse {
                 self.exhausted = true;
                 return null;
             };
-            self.slice = items[0..count];
+            self.batch_index = 0;
+            self.batch_len = @intCast(count);
+            self.uses_internal_buffer = (items == @as([*]objc.c.id, @ptrCast(&self.buffer)));
         }
 
         if (self.state.mutationsPtr) |mp| {
-            if (mp.* != self.start_mutation) {
+            const cur_mutation = if (self.mutations_self_offset != no_self_offset) blk: {
+                const relocated: *const c_ulong = @ptrFromInt(@intFromPtr(&self.state) + self.mutations_self_offset);
+                break :blk relocated.*;
+            } else mp.*;
+            if (cur_mutation != self.start_mutation) {
                 objc.c.objc_enumerationMutation(self.object.value);
             }
         }
 
-        const first = self.slice[0];
-        self.slice = self.slice[1..];
-        return objc.Object.fromId(first);
+        const idx = self.batch_index;
+        self.batch_index = idx + 1;
+        const raw_id = if (self.uses_internal_buffer)
+            self.buffer[idx]
+        else
+            self.state.itemsPtr.?[idx];
+        return objc.Object.fromId(raw_id);
     }
 };
 
@@ -241,4 +265,68 @@ test "intra-batch mutation during iteration throws NSGenericException" {
             );
         },
     }
+}
+
+test "moving an active NSDictionary Iterator across stack frames remains valid" {
+    const testing = std.testing;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSMutableDictionary = objc.getClass("NSMutableDictionary").?;
+    const NSNumber = objc.getClass("NSNumber").?;
+
+    const total: c_int = 25;
+    const dict = NSMutableDictionary.msgSend(
+        objc.Object,
+        "dictionaryWithCapacity:",
+        .{@as(c_ulong, @intCast(total))},
+    );
+    var expected_sum: c_int = 0;
+    for (1..@as(usize, @intCast(total + 1))) |idx| {
+        const val: c_int = @intCast(idx);
+        expected_sum += val;
+        const num = NSNumber.msgSend(objc.Object, "numberWithInt:", .{val});
+        dict.msgSend(void, "setObject:forKey:", .{
+            num,
+            num.getProperty(objc.Object, "stringValue"),
+        });
+    }
+
+    const Helpers = struct {
+        const Started = struct {
+            iter: Iterator,
+            first_val: c_int,
+        };
+
+        noinline fn startAndConsumeOne(d: objc.Object) Started {
+            var it = d.iterate();
+            const first_key = it.next().?;
+            const first_obj = d.msgSend(objc.Object, "objectForKey:", .{first_key});
+            return .{
+                .iter = it,
+                .first_val = first_obj.getProperty(c_int, "intValue"),
+            };
+        }
+
+        noinline fn clobberStackFrame() void {
+            var poison: [128]usize = @splat(0xDEAD_BEEF_CAFE_BABE);
+            std.mem.doNotOptimizeAway(&poison);
+        }
+    };
+
+    const started = Helpers.startAndConsumeOne(dict);
+    Helpers.clobberStackFrame();
+
+    var moved_iter = started.iter;
+    try testing.expect(moved_iter.uses_internal_buffer);
+
+    var count: c_int = 1;
+    var sum: c_int = started.first_val;
+    while (moved_iter.next()) |key| {
+        const num = dict.msgSend(objc.Object, "objectForKey:", .{key});
+        sum += num.getProperty(c_int, "intValue");
+        count += 1;
+    }
+    try testing.expectEqual(total, count);
+    try testing.expectEqual(expected_sum, sum);
 }
