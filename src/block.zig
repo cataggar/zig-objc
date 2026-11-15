@@ -1,7 +1,7 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
+const abi = @import("abi.zig");
 const cpkg = @import("c.zig");
 const c = cpkg.c;
 const objc = @import("main.zig");
@@ -73,11 +73,11 @@ pub fn impImplementationWithBlock(block: anytype) c.IMP {
         objc.Object => block.value,
         *anyopaque, *const anyopaque => objc.Object.fromId(@constCast(block)).value,
         else => switch (@typeInfo(T)) {
-            .@"struct" => if (comptime isBlockRefType(T))
+            .@"struct" => if (comptime abi.isBlockRefType(T))
                 objc.Object.fromId(block.value).value
             else
                 @compileError("impImplementationWithBlock expected *Block.Context, BlockRef, Object, c.id, or *anyopaque, got " ++ @typeName(T)),
-            .pointer => |ptr_info| if (ptr_info.size == .one and comptime isBlockContextStruct(ptr_info.child))
+            .pointer => |ptr_info| if (ptr_info.size == .one and comptime abi.isBlockContextStruct(ptr_info.child))
                 objc.Object.fromId(@as(*anyopaque, @ptrCast(@constCast(block)))).value
             else
                 @compileError("impImplementationWithBlock expected *Block.Context, BlockRef, Object, c.id, or *anyopaque, got " ++ @typeName(T)),
@@ -113,72 +113,64 @@ pub fn BlockRef(comptime Args: anytype, comptime Return: type) type {
         const Self = @This();
 
         pub const is_objc_block = true;
+        pub const zig_objc_is_block_ref = true;
         pub const ReturnType = Return;
         pub const InvokeFn = BlockRefInvokeFn(&param_types, Return);
 
         value: *anyopaque,
 
         /// Wraps a nullable raw block pointer, returning `null` if `ptr` is `null`.
-        pub fn fromPtr(ptr: ?*const anyopaque) ?Self {
+        pub inline fn fromPtr(ptr: ?*const anyopaque) ?Self {
             const p = ptr orelse return null;
             return .{ .value = @constCast(p) };
         }
 
         /// Wraps a nullable Objective-C `id`, returning `null` if `id` is `null`.
-        pub fn fromId(id: c.id) ?Self {
+        pub inline fn fromId(id: c.id) ?Self {
             if (id == null) return null;
             return .{ .value = @ptrCast(id) };
         }
 
         /// Wraps a non-null `objc.Object` representing a block.
-        pub fn fromObject(obj: objc.Object) Self {
+        pub inline fn fromObject(obj: objc.Object) Self {
             assert(obj.value != null);
             return .{ .value = @ptrCast(obj.value) };
         }
 
         /// Wraps a pointer (`*Context` or `*const Context`) to a Zig `Block` context.
-        pub fn fromContext(ctx_ptr: anytype) Self {
+        pub inline fn fromContext(ctx_ptr: anytype) Self {
             const Ptr = @TypeOf(ctx_ptr);
             const ptr_info = @typeInfo(Ptr);
-            if (comptime (ptr_info != .pointer or ptr_info.pointer.size != .one or !isBlockContextStruct(ptr_info.pointer.child))) {
+            if (comptime (ptr_info != .pointer or ptr_info.pointer.size != .one or !abi.isBlockContextStruct(ptr_info.pointer.child))) {
                 @compileError("BlockRef.fromContext expected a single-item pointer to a Block Context, got " ++ @typeName(Ptr));
             }
             return .{ .value = @ptrCast(@constCast(ctx_ptr)) };
         }
 
         /// Views this block as an `objc.Object` (`id`).
-        pub fn asObject(self: Self) objc.Object {
+        pub inline fn asObject(self: Self) objc.Object {
             return objc.Object.fromId(self.value);
         }
 
         /// Invokes the underlying Clang/Objective-C block with `args`.
-        pub fn invoke(self: Self, args: anytype) Return {
-            const args_info = switch (@typeInfo(@TypeOf(args))) {
-                .@"struct" => |s| s,
-                else => @compileError("BlockRef.invoke expected a tuple of arguments"),
-            };
-            if (args_info.field_types.len != param_types.len) {
-                @compileError("BlockRef.invoke argument count mismatch");
-            }
-
+        pub inline fn invoke(self: Self, args: anytype) Return {
             const layout: *const BlockLayout = @ptrCast(@alignCast(self.value));
             const invoke_fn: *const InvokeFn = @ptrCast(@alignCast(layout.invoke));
-
-            var c_args: UnwrappedTuple(&param_types) = undefined;
-            inline for (param_types, 0..) |ParamType, i| {
-                const typed_arg: ParamType = args[i];
-                c_args[i] = unwrapBlockArg(ParamType, typed_arg);
-            }
-
-            const raw_result = @call(.auto, invoke_fn, .{self.value} ++ c_args);
-            return wrapBlockReturn(Return, raw_result);
+            const call_args = abi.buildTypedCallArgs(.{self.value}, &param_types, args, true);
+            return abi.wrapReturn(Return, @call(.auto, invoke_fn, call_args), true);
         }
 
-        /// Copies the block to the heap (or increments its reference count) via `_Block_copy`.
-        /// Pair with `release()`.
-        pub fn copy(self: Self) Self {
-            const copied = c._Block_copy(self.value) orelse @panic("_Block_copy returned null");
+        /// Copies the block to the heap (or increments its reference count) via `_Block_copy`,
+        /// returning `error.OutOfMemory` if heap allocation fails. Pair with `release()`.
+        pub fn tryCopy(self: Self) Allocator.Error!Self {
+            const copied = c._Block_copy(self.value) orelse return error.OutOfMemory;
             return .{ .value = copied };
+        }
+
+        /// Copies the block to the heap (or increments its reference count) via `_Block_copy`,
+        /// panicking on out-of-memory. Pair with `release()`.
+        pub fn copy(self: Self) Self {
+            return self.tryCopy() catch @panic("zig-objc: _Block_copy failed (out of memory)");
         }
 
         /// Releases a copied block via `_Block_release`.
@@ -207,6 +199,7 @@ pub fn Block(
     comptime Args: anytype,
     comptime Return: type,
 ) type {
+    comptime validateCaptures(CapturesArg);
     const param_types = extractParamTypes(Args);
 
     return struct {
@@ -217,24 +210,27 @@ pub fn Block(
         const has_managed_captures = hasManagedCaptures(Captures);
         const DescriptorType = if (has_managed_captures) DescriptorWithCopyDispose else DescriptorSimple;
 
-        const InvokeFn = FnType(anyopaque);
-        const SignatureFn = FnType(BlockLayout);
-        const CReturn = cAbiBlockFnType(Return);
+        const InvokeReturn = abi.UnwrapReturnType(Return, true);
+        const InvokeFn = makeInvokeFnType(&param_types, Return);
+        const SignatureFn = makeSignatureFnType(&param_types, Return);
+        const needs_bool_trampoline = (c.BOOL != bool) and (Return == bool or hasBoolParam(&param_types));
+
+        pub const signature_encoding = objc.comptimeEncode(SignatureFn);
 
         const descriptor: DescriptorType = if (has_managed_captures) .{
             .reserved = 0,
             .size = @sizeOf(Context),
             .copy_helper = &descCopyHelper,
             .dispose_helper = &descDisposeHelper,
-            .signature = &objc.comptimeEncode(SignatureFn),
+            .signature = &signature_encoding,
         } else .{
             .reserved = 0,
             .size = @sizeOf(Context),
-            .signature = &objc.comptimeEncode(SignatureFn),
+            .signature = &signature_encoding,
         };
 
         /// This is the function type that is called back.
-        pub const Fn = FnType(Context);
+        pub const Fn = makeUserFnType(Context, &param_types, Return);
 
         /// The captures type, so it can be easily referenced again.
         pub const Captures = CapturesArg;
@@ -243,7 +239,7 @@ pub fn Block(
         pub const Ref = BlockRef(Args, Return);
 
         /// This is the block context sent as the first parameter to the function.
-        pub const Context = BlockContext(Captures, InvokeFn, DescriptorType);
+        pub const Context = BlockContext(Captures, InvokeFn, DescriptorType, needs_bool_trampoline);
 
         /// Create a new stack-allocated block context.
         ///
@@ -255,11 +251,16 @@ pub fn Block(
             ctx.isa = NSConcreteStackBlock;
             ctx.flags = .{
                 .copy_dispose = has_managed_captures,
-                .stret = cpkg.usesStret(CReturn),
+                .stret = cpkg.usesStret(InvokeReturn),
                 .signature = true,
             };
             ctx.reserved = 0;
-            ctx.invoke = @ptrCast(func);
+            if (comptime needs_bool_trampoline) {
+                ctx.invoke = comptime makeBoolTrampoline();
+                ctx.__zig_objc_user_invoke = @ptrCast(func);
+            } else {
+                ctx.invoke = @ptrCast(func);
+            }
             ctx.descriptor = &descriptor;
             inline for (captures_info.field_names, captures_info.field_types) |field_name, field_type| {
                 @field(ctx, field_name) = storeCaptureField(field_type, @field(captures, field_name));
@@ -276,12 +277,24 @@ pub fn Block(
                 @compileError("Block.initGlobal requires an empty Captures struct (struct {})");
             }
             const Static = struct {
-                const global_ctx: Context = .{
+                const global_ctx: Context = if (needs_bool_trampoline) .{
                     .isa = NSConcreteGlobalBlock,
                     .flags = .{
                         .copy_dispose = false,
                         .global = true,
-                        .stret = cpkg.usesStret(CReturn),
+                        .stret = cpkg.usesStret(InvokeReturn),
+                        .signature = true,
+                    },
+                    .reserved = 0,
+                    .invoke = makeBoolTrampoline(),
+                    .descriptor = &descriptor,
+                    .__zig_objc_user_invoke = @ptrCast(func),
+                } else .{
+                    .isa = NSConcreteGlobalBlock,
+                    .flags = .{
+                        .copy_dispose = false,
+                        .global = true,
+                        .stret = cpkg.usesStret(InvokeReturn),
                         .signature = true,
                     },
                     .reserved = 0,
@@ -303,23 +316,14 @@ pub fn Block(
         }
 
         /// Invoke the block with the given arguments beyond the captured scope.
-        pub fn invoke(ctx: *const Context, args: anytype) Return {
-            const args_info = switch (@typeInfo(@TypeOf(args))) {
-                .@"struct" => |s| s,
-                else => @compileError("Block.invoke expected a tuple of arguments"),
-            };
-            if (args_info.field_types.len != param_types.len) {
-                @compileError("Block.invoke argument count mismatch");
-            }
-
-            var c_args: BlockFnTuple(&param_types) = undefined;
-            inline for (param_types, 0..) |ParamType, i| {
-                const typed_arg: ParamType = args[i];
-                c_args[i] = unwrapForBlockFn(ParamType, typed_arg);
-            }
-
-            const raw = @call(.auto, ctx.invoke, .{ctx} ++ c_args);
-            return wrapFromBlockFn(Return, raw);
+        pub inline fn invoke(ctx: *const Context, args: anytype) Return {
+            const call_args = abi.buildTypedCallArgs(
+                .{@as(*const anyopaque, @ptrCast(ctx))},
+                &param_types,
+                args,
+                true,
+            );
+            return abi.wrapReturn(Return, @call(.auto, ctx.invoke, call_args), true);
         }
 
         /// Copies the given context to the heap (or increments its reference count).
@@ -338,12 +342,12 @@ pub fn Block(
         }
 
         /// Wraps `ctx` in a typed `BlockRef(Args, Return)`.
-        pub fn asBlockRef(ctx: *const Context) Ref {
+        pub inline fn asBlockRef(ctx: *const Context) Ref {
             return Ref.fromContext(ctx);
         }
 
         /// Views `ctx` as an `objc.Object` (`id`).
-        pub fn asObject(ctx: *const Context) objc.Object {
+        pub inline fn asObject(ctx: *const Context) objc.Object {
             return objc.Object.fromId(@as(*anyopaque, @ptrCast(@constCast(ctx))));
         }
 
@@ -389,13 +393,91 @@ pub fn Block(
             }
         }
 
-        /// Creates a function type for the invocation function, altering the first arg.
-        fn FnType(comptime ContextArg: type) type {
-            var fn_params: [param_types.len + 1]type = undefined;
-            fn_params[0] = *const ContextArg;
-            for (param_types, 1..) |Arg, i| fn_params[i] = cAbiBlockFnType(Arg);
+        inline fn userFnPtr(ctx: *const Context) *const Fn {
+            return @ptrCast(@alignCast(ctx.__zig_objc_user_invoke));
+        }
 
-            return @Fn(&fn_params, &@splat(.{}), cAbiBlockFnType(Return), .{ .@"callconv" = .c });
+        inline fn fromRawInvokeParam(comptime T: type, raw: abi.UnwrapParamType(T, true)) cAbiBlockFnParamType(T) {
+            if (comptime T == bool) return cpkg.boolResult(raw);
+            if (comptime abi.isBlockRefType(T)) return T{ .value = raw };
+            return raw;
+        }
+
+        inline fn toRawInvokeReturn(res: cAbiBlockFnReturnType(Return)) InvokeReturn {
+            if (comptime Return == void) return;
+            if (comptime Return == bool) return cpkg.boolParam(res);
+            if (comptime abi.isBlockRefType(Return)) return res.value;
+            return res;
+        }
+
+        /// Generates a zero-allocation `callconv(.c)` C-ABI trampoline on targets where
+        /// Objective-C `BOOL` (`i8` on `x86_64`) differs from Zig `bool` (`_Bool`),
+        /// converting non-`0/1` `BOOL` bytes safely before calling the user `Fn`.
+        fn InvokeParam(comptime idx: usize) type {
+            return abi.UnwrapParamType(param_types[idx], true);
+        }
+
+        fn makeBoolTrampoline() *const InvokeFn {
+            const P = InvokeParam;
+            const f = fromRawInvokeParam;
+            const r = toRawInvokeReturn;
+            return switch (param_types.len) {
+                0 => &(struct {
+                    fn call(raw_ctx: *const anyopaque) callconv(.c) InvokeReturn {
+                        const ctx: *const Context = @ptrCast(@alignCast(raw_ctx));
+                        return r(userFnPtr(ctx)(ctx));
+                    }
+                }).call,
+                1 => &(struct {
+                    fn call(raw_ctx: *const anyopaque, a0: P(0)) callconv(.c) InvokeReturn {
+                        const ctx: *const Context = @ptrCast(@alignCast(raw_ctx));
+                        return r(userFnPtr(ctx)(ctx, f(param_types[0], a0)));
+                    }
+                }).call,
+                2 => &(struct {
+                    fn call(raw_ctx: *const anyopaque, a0: P(0), a1: P(1)) callconv(.c) InvokeReturn {
+                        const ctx: *const Context = @ptrCast(@alignCast(raw_ctx));
+                        return r(userFnPtr(ctx)(ctx, f(param_types[0], a0), f(param_types[1], a1)));
+                    }
+                }).call,
+                3 => &(struct {
+                    fn call(raw_ctx: *const anyopaque, a0: P(0), a1: P(1), a2: P(2)) callconv(.c) InvokeReturn {
+                        const ctx: *const Context = @ptrCast(@alignCast(raw_ctx));
+                        return r(userFnPtr(ctx)(ctx, f(param_types[0], a0), f(param_types[1], a1), f(param_types[2], a2)));
+                    }
+                }).call,
+                4 => &(struct {
+                    fn call(raw_ctx: *const anyopaque, a0: P(0), a1: P(1), a2: P(2), a3: P(3)) callconv(.c) InvokeReturn {
+                        const ctx: *const Context = @ptrCast(@alignCast(raw_ctx));
+                        return r(userFnPtr(ctx)(ctx, f(param_types[0], a0), f(param_types[1], a1), f(param_types[2], a2), f(param_types[3], a3)));
+                    }
+                }).call,
+                5 => &(struct {
+                    fn call(raw_ctx: *const anyopaque, a0: P(0), a1: P(1), a2: P(2), a3: P(3), a4: P(4)) callconv(.c) InvokeReturn {
+                        const ctx: *const Context = @ptrCast(@alignCast(raw_ctx));
+                        return r(userFnPtr(ctx)(ctx, f(param_types[0], a0), f(param_types[1], a1), f(param_types[2], a2), f(param_types[3], a3), f(param_types[4], a4)));
+                    }
+                }).call,
+                6 => &(struct {
+                    fn call(raw_ctx: *const anyopaque, a0: P(0), a1: P(1), a2: P(2), a3: P(3), a4: P(4), a5: P(5)) callconv(.c) InvokeReturn {
+                        const ctx: *const Context = @ptrCast(@alignCast(raw_ctx));
+                        return r(userFnPtr(ctx)(ctx, f(param_types[0], a0), f(param_types[1], a1), f(param_types[2], a2), f(param_types[3], a3), f(param_types[4], a4), f(param_types[5], a5)));
+                    }
+                }).call,
+                7 => &(struct {
+                    fn call(raw_ctx: *const anyopaque, a0: P(0), a1: P(1), a2: P(2), a3: P(3), a4: P(4), a5: P(5), a6: P(6)) callconv(.c) InvokeReturn {
+                        const ctx: *const Context = @ptrCast(@alignCast(raw_ctx));
+                        return r(userFnPtr(ctx)(ctx, f(param_types[0], a0), f(param_types[1], a1), f(param_types[2], a2), f(param_types[3], a3), f(param_types[4], a4), f(param_types[5], a5), f(param_types[6], a6)));
+                    }
+                }).call,
+                8 => &(struct {
+                    fn call(raw_ctx: *const anyopaque, a0: P(0), a1: P(1), a2: P(2), a3: P(3), a4: P(4), a5: P(5), a6: P(6), a7: P(7)) callconv(.c) InvokeReturn {
+                        const ctx: *const Context = @ptrCast(@alignCast(raw_ctx));
+                        return r(userFnPtr(ctx)(ctx, f(param_types[0], a0), f(param_types[1], a1), f(param_types[2], a2), f(param_types[3], a3), f(param_types[4], a4), f(param_types[5], a5), f(param_types[6], a6), f(param_types[7], a7)));
+                    }
+                }).call,
+                else => @compileError("Block with bool parameters/return on targets where Objective-C BOOL != bool supports up to 8 parameters"),
+            };
         }
     };
 }
@@ -406,37 +488,157 @@ const CaptureKind = enum {
     block,
 };
 
-fn isBlockRefType(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and @hasDecl(T, "is_objc_block") and @hasField(T, "value");
+fn isWeakValueType(comptime T: type) bool {
+    if (@typeInfo(T) != .@"struct") return false;
+    if (@hasDecl(T, "zig_objc_is_weak")) return true;
+    return @hasField(T, "slot") and
+        (@hasDecl(T, "loadRetained") or @hasDecl(T, "loadAutoreleased") or @hasDecl(T, "load")) and
+        @hasDecl(T, "deinit");
 }
 
-fn isBlockContextStruct(comptime T: type) bool {
-    if (@typeInfo(T) != .@"struct") return false;
-    if (@hasDecl(T, "is_objc_block_context")) return true;
-    const info = @typeInfo(T).@"struct";
-    if (info.field_names.len < 5) return false;
-    return std.mem.eql(u8, info.field_names[0], "isa") and
-        std.mem.eql(u8, info.field_names[1], "flags") and
-        std.mem.eql(u8, info.field_names[2], "reserved") and
-        std.mem.eql(u8, info.field_names[3], "invoke") and
-        std.mem.eql(u8, info.field_names[4], "descriptor");
+fn validateCaptures(comptime Captures: type) void {
+    const info = switch (@typeInfo(Captures)) {
+        .@"struct" => |s| s,
+        else => @compileError("Block Captures must be a struct (use struct {} for no captures), got " ++ @typeName(Captures)),
+    };
+    if (info.is_tuple) {
+        @compileError("Block Captures must be a named-field struct (use struct {} for no captures), got tuple " ++ @typeName(Captures));
+    }
+    for (info.field_names, info.field_types, info.field_attrs) |field_name, field_type, field_attr| {
+        if (std.mem.eql(u8, field_name, "__zig_objc_user_invoke")) {
+            @compileError("Block capture field name '__zig_objc_user_invoke' is reserved");
+        }
+        const natural_align = if (@sizeOf(field_type) == 0) 1 else @alignOf(field_type);
+        const explicit_align: usize = if (@typeInfo(@TypeOf(field_attr.@"align")) == .optional)
+            (field_attr.@"align" orelse natural_align)
+        else
+            field_attr.@"align";
+        if (@max(natural_align, explicit_align) > 16) {
+            @compileError("Block captures cannot have alignment > 16 bytes because macOS _Block_copy uses 16-byte malloc alignment; capture a 16-byte aligned pointer instead");
+        }
+        validateCaptureFieldType(field_type, false);
+    }
+}
+
+fn validateCapturePointerTarget(comptime Pointee: type) void {
+    switch (@typeInfo(Pointee)) {
+        .optional => |opt| {
+            if (abi.WrapperUnderlying(opt.child) != null or abi.isBlockRefType(opt.child) or
+                @typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice)
+            {
+                @compileError("pointer/array element " ++ @typeName(Pointee) ++ " is a 16-byte Zig optional struct, not an 8-byte C pointer; for Objective-C out-parameters like id* / NSError**, use *objc.Object (initialized to .{ .value = null }) or *objc.c.id");
+            }
+            validateCapturePointerTarget(@typeInfo(opt.child).pointer.child);
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                @compileError("C-ABI pointer/array element cannot be Zig slice " ++ @typeName(Pointee) ++ "; pass .ptr and .len");
+            }
+            validateCapturePointerTarget(ptr.child);
+        },
+        .array => |arr| validateCapturePointerTarget(arr.child),
+        else => {},
+    }
+}
+
+fn validateCaptureFieldType(comptime T: type, comptime nested_aggregate: bool) void {
+    if (abi.isBlockContextStruct(T)) {
+        @compileError("Block captures cannot store a Block.Context by value; capture *const Block.Context, BlockRef, or objc.Object instead");
+    }
+    if (isWeakValueType(T)) {
+        @compileError("Block captures cannot store objc.Weak by value (memcpy would corrupt Objective-C weak side tables); capture *objc.Weak instead");
+    }
+    if (T == comptime_int) {
+        @compileError("Block capture cannot have type comptime_int; cast to a concrete integer type with @as");
+    }
+    if (T == comptime_float) {
+        @compileError("Block capture cannot have type comptime_float; cast to a concrete float type with @as");
+    }
+    if (@sizeOf(T) > 0 and @alignOf(T) > 16) {
+        @compileError("Block captures cannot have alignment > 16 bytes because macOS _Block_copy uses 16-byte malloc alignment; capture a 16-byte aligned pointer instead");
+    }
+    if (nested_aggregate and classifyCaptureType(T) != .plain) {
+        @compileError("Block captures cannot store ARC-managed objects or blocks inside a nested array, struct, or union (" ++ @typeName(T) ++ "); capture individual fields or a pointer instead");
+    }
+    if (abi.WrapperUnderlying(T) != null or abi.isBlockRefType(T)) return;
+
+    switch (@typeInfo(T)) {
+        .int, .float, .bool, .@"enum", .vector => {},
+        .array => |arr| validateCaptureFieldType(arr.child, true),
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                @compileError("Block captures cannot store Zig slice " ++ @typeName(T) ++ " by value; capture a pointer or separate .ptr and .len fields instead");
+            }
+            validateCapturePointerTarget(ptr.child);
+        },
+        .@"struct" => |s| {
+            if (s.layout == .auto) {
+                @compileError("Block captures cannot store auto-layout struct " ++ @typeName(T) ++ " by value; use an extern struct or capture *" ++ @typeName(T) ++ " instead");
+            }
+            for (s.field_types, s.field_attrs) |FieldType, field_attr| {
+                if (s.layout == .@"extern") {
+                    const nat = if (@sizeOf(FieldType) == 0) 1 else @alignOf(FieldType);
+                    const exp: usize = if (@typeInfo(@TypeOf(field_attr.@"align")) == .optional)
+                        (field_attr.@"align" orelse nat)
+                    else
+                        field_attr.@"align";
+                    if (@max(nat, exp) > 16) {
+                        @compileError("Block captures cannot have alignment > 16 bytes because macOS _Block_copy uses 16-byte malloc alignment; capture a 16-byte aligned pointer instead");
+                    }
+                }
+                validateCaptureFieldType(FieldType, true);
+            }
+        },
+        .@"union" => |u| {
+            if (u.layout == .auto) {
+                @compileError("Block captures cannot store auto-layout union " ++ @typeName(T) ++ " by value; use an extern union or capture *" ++ @typeName(T) ++ " instead");
+            }
+            for (u.field_types, u.field_attrs) |FieldType, field_attr| {
+                if (u.layout == .@"extern") {
+                    const nat = if (@sizeOf(FieldType) == 0) 1 else @alignOf(FieldType);
+                    const exp: usize = if (@typeInfo(@TypeOf(field_attr.@"align")) == .optional)
+                        (field_attr.@"align" orelse nat)
+                    else
+                        field_attr.@"align";
+                    if (@max(nat, exp) > 16) {
+                        @compileError("Block captures cannot have alignment > 16 bytes because macOS _Block_copy uses 16-byte malloc alignment; capture a 16-byte aligned pointer instead");
+                    }
+                }
+                validateCaptureFieldType(FieldType, true);
+            }
+        },
+        .optional => |opt| {
+            if (abi.isBlockContextStruct(opt.child)) {
+                @compileError("Block captures cannot store a Block.Context by value; capture ?*const Block.Context, ?BlockRef, or ?objc.Object instead");
+            }
+            if (isWeakValueType(opt.child)) {
+                @compileError("Block captures cannot store objc.Weak by value (memcpy would corrupt Objective-C weak side tables); capture *objc.Weak instead");
+            }
+            if (abi.WrapperUnderlying(opt.child) != null or abi.isBlockRefType(opt.child)) return;
+            if (@typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice) {
+                @compileError("Block captures cannot store non-pointer optional " ++ @typeName(T) ++ " by value; capture a pointer or separate flag and value fields instead");
+            }
+            validateCapturePointerTarget(@typeInfo(opt.child).pointer.child);
+        },
+        else => @compileError("Block captures do not support type " ++ @typeName(T) ++ "; capture a pointer or extern-compatible type instead"),
+    }
 }
 
 fn classifyCaptureType(comptime T: type) CaptureKind {
     if (T == c.id or T == objc.Object or T == ?objc.Object) return .object;
-    if (isBlockRefType(T)) return .block;
+    if (abi.isBlockRefType(T)) return .block;
 
     return switch (@typeInfo(T)) {
-        .optional => |opt| if (isBlockRefType(opt.child))
+        .optional => |opt| if (abi.isBlockRefType(opt.child))
             .block
         else switch (@typeInfo(opt.child)) {
-            .pointer => |ptr| if ((ptr.size == .one or ptr.size == .c) and isBlockContextStruct(ptr.child))
+            .pointer => |ptr| if ((ptr.size == .one or ptr.size == .c) and abi.isBlockContextStruct(ptr.child))
                 .block
             else
                 .plain,
             else => .plain,
         },
-        .pointer => |ptr| if ((ptr.size == .one or ptr.size == .c) and isBlockContextStruct(ptr.child))
+        .pointer => |ptr| if ((ptr.size == .one or ptr.size == .c) and abi.isBlockContextStruct(ptr.child))
             .block
         else
             .plain,
@@ -452,69 +654,60 @@ fn hasManagedCaptures(comptime Captures: type) bool {
     return false;
 }
 
+fn hasBoolParam(comptime param_types: []const type) bool {
+    for (param_types) |T| {
+        if (T == bool) return true;
+    }
+    return false;
+}
+
 fn ContextFieldType(comptime T: type) type {
-    return switch (T) {
-        objc.Object, ?objc.Object => c.id,
-        objc.Class, ?objc.Class => c.Class,
-        objc.Sel, ?objc.Sel => c.SEL,
-        objc.Protocol => *c.Protocol,
-        ?objc.Protocol => ?*c.Protocol,
-        objc.Property => c.objc_property_t,
-        ?objc.Property => ?c.objc_property_t,
-        else => switch (@typeInfo(T)) {
-            .optional => |opt| if (isBlockRefType(opt.child)) ?*anyopaque else T,
-            else => T,
-        },
+    if (abi.WrapperUnderlying(T)) |U| return U;
+    return switch (@typeInfo(T)) {
+        .optional => |opt| if (abi.WrapperUnderlying(opt.child)) |U|
+            abi.NullablePtr(U)
+        else if (abi.isBlockRefType(opt.child))
+            ?*anyopaque
+        else
+            T,
+        else => T,
     };
 }
 
 inline fn storeCaptureField(comptime FieldType: type, val: FieldType) ContextFieldType(FieldType) {
-    return switch (FieldType) {
-        objc.Object => val.value,
-        ?objc.Object => if (val) |o| o.value else null,
-        objc.Class => val.value,
-        ?objc.Class => if (val) |cls| cls.value else null,
-        objc.Sel => val.value,
-        ?objc.Sel => if (val) |s| s.value else null,
-        objc.Protocol => val.value,
-        ?objc.Protocol => if (val) |p| p.value else null,
-        objc.Property => val.value,
-        ?objc.Property => if (val) |p| p.value else null,
-        else => switch (@typeInfo(FieldType)) {
-            .optional => |opt| if (comptime isBlockRefType(opt.child))
-                (if (val) |b| b.value else null)
-            else
-                val,
-            else => val,
-        },
-    };
+    if (comptime abi.WrapperUnderlying(FieldType) != null) return val.value;
+    if (comptime @typeInfo(FieldType) == .optional) {
+        const Child = @typeInfo(FieldType).optional.child;
+        if (comptime (abi.WrapperUnderlying(Child) != null or abi.isBlockRefType(Child))) {
+            return if (val) |v| v.value else null;
+        }
+    }
+    return val;
 }
 
 inline fn loadCaptureField(comptime FieldType: type, stored: ContextFieldType(FieldType)) FieldType {
-    return switch (FieldType) {
-        objc.Object => objc.Object.fromId(stored),
-        ?objc.Object => if (stored == null) null else objc.Object.fromId(stored),
-        objc.Class => .{ .value = stored },
-        ?objc.Class => if (stored) |ptr| .{ .value = ptr } else null,
-        objc.Sel => .{ .value = stored },
-        ?objc.Sel => if (stored == null) null else .{ .value = stored },
-        objc.Protocol => .{ .value = stored },
-        ?objc.Protocol => if (stored) |ptr| .{ .value = ptr } else null,
-        objc.Property => .{ .value = stored },
-        ?objc.Property => if (stored) |ptr| .{ .value = ptr } else null,
-        else => switch (@typeInfo(FieldType)) {
-            .optional => |opt| if (comptime isBlockRefType(opt.child))
-                (if (stored) |p| opt.child{ .value = p } else null)
-            else
-                stored,
-            else => stored,
-        },
-    };
+    if (FieldType == objc.Object) return objc.Object.fromId(stored);
+    if (comptime abi.WrapperUnderlying(FieldType) != null) return FieldType{ .value = stored };
+    if (comptime @typeInfo(FieldType) == .optional) {
+        const Child = @typeInfo(FieldType).optional.child;
+        if (Child == objc.Object) return if (stored == null) null else objc.Object.fromId(stored);
+        if (comptime abi.isBlockRefType(Child)) {
+            return if (stored) |p| Child{ .value = p } else null;
+        }
+        if (comptime abi.WrapperUnderlying(Child)) |U| {
+            if (comptime (@typeInfo(U) == .optional or (@typeInfo(U) == .pointer and @typeInfo(U).pointer.size == .c))) {
+                return if (stored == null) null else Child{ .value = stored };
+            } else {
+                return if (stored) |p| Child{ .value = p } else null;
+            }
+        }
+    }
+    return stored;
 }
 
 inline fn extractRawCapturePtr(stored: anytype) ?*const anyopaque {
     const T = @TypeOf(stored);
-    if (comptime isBlockRefType(T)) return stored.value;
+    if (comptime abi.isBlockRefType(T)) return stored.value;
     return switch (@typeInfo(T)) {
         .optional => if (stored) |p| @ptrCast(p) else null,
         .pointer => |ptr| switch (ptr.size) {
@@ -543,175 +736,77 @@ fn extractParamTypes(comptime Args: anytype) [Args.len]type {
     return result;
 }
 
-fn WrapperUnderlying(comptime T: type) ?type {
-    return switch (T) {
-        objc.Object => c.id,
-        objc.Class => c.Class,
-        objc.Protocol => *c.Protocol,
-        objc.Sel => c.SEL,
-        objc.Property => c.objc_property_t,
-        objc.Ivar => c.Ivar,
-        objc.Method => c.Method,
-        else => null,
-    };
+/// Validates and maps `Block` parameter types for `Block.Fn`, keeping Zig `bool` and
+/// `BlockRef(...)` intact while unwrapping `objc` runtime wrappers to their C-ABI pointers.
+fn cAbiBlockFnParamType(comptime T: type) type {
+    if (abi.isBlockRefType(T)) return T;
+    return abi.UnwrapParamType(T, false);
 }
 
-fn NullablePtr(comptime V: type) type {
-    return switch (@typeInfo(V)) {
-        .optional => V,
-        .pointer => |p| if (p.size == .c) V else ?V,
-        else => unreachable,
-    };
+/// Validates and maps `Block` return types for `Block.Fn`, keeping Zig `bool`, `BlockRef(...)`,
+/// and `*c.Protocol` intact while unwrapping `objc` runtime wrappers.
+fn cAbiBlockFnReturnType(comptime T: type) type {
+    if (T == void) return void;
+    if (abi.isBlockRefType(T)) return T;
+    if (T == objc.Protocol) return *c.Protocol;
+    return abi.UnwrapReturnType(T, false);
 }
 
-/// Maps non-extern `objc` wrapper types to C-ABI types for `Block.Fn` while keeping `bool`
-/// intact so existing Zig `Block` callbacks continue using native `bool`.
-fn cAbiBlockFnType(comptime T: type) type {
-    if (WrapperUnderlying(T)) |V| return V;
-    if (@typeInfo(T) == .optional) {
-        const Child = @typeInfo(T).optional.child;
-        if (WrapperUnderlying(Child)) |V| return NullablePtr(V);
-        if (isBlockRefType(Child)) return ?*anyopaque;
+fn makeUserFnType(comptime ContextArg: type, comptime param_types: []const type, comptime Return: type) type {
+    var fn_params: [param_types.len + 1]type = undefined;
+    fn_params[0] = *const ContextArg;
+    for (param_types, 1..) |Arg, i| fn_params[i] = cAbiBlockFnParamType(Arg);
+    return @Fn(&fn_params, &@splat(.{}), cAbiBlockFnReturnType(Return), .{ .@"callconv" = .c });
+}
+
+fn makeInvokeFnType(comptime param_types: []const type, comptime Return: type) type {
+    var fn_params: [param_types.len + 1]type = undefined;
+    fn_params[0] = *const anyopaque;
+    for (param_types, 1..) |Arg, i| fn_params[i] = abi.UnwrapParamType(Arg, true);
+    return @Fn(&fn_params, &@splat(.{}), abi.UnwrapReturnType(Return, true), .{ .@"callconv" = .c });
+}
+
+fn signatureParamType(comptime T: type) type {
+    if (abi.isBlockRefType(T)) return *const BlockLayout;
+    if (@typeInfo(T) == .optional and abi.isBlockRefType(@typeInfo(T).optional.child)) {
+        return ?*const BlockLayout;
     }
-    if (@typeInfo(T) == .@"struct") {
-        const s = @typeInfo(T).@"struct";
-        if (s.layout != .@"extern" and s.layout != .@"packed") {
-            @compileError("Block: " ++ @typeName(T) ++ " — struct must be extern or packed");
-        }
-        if (s.layout == .@"packed" and @bitSizeOf(T) > 128) {
-            @compileError("Block: " ++ @typeName(T) ++ " — packed struct larger than 128 bits is not C-ABI compatible");
-        }
-    }
-    return T;
+    return abi.UnwrapParamType(T, true);
 }
 
-fn BlockFnTuple(comptime param_types: []const type) type {
-    var types: [param_types.len]type = undefined;
-    for (param_types, 0..) |T, i| types[i] = cAbiBlockFnType(T);
-    return @Tuple(&types);
+fn signatureReturnType(comptime T: type) type {
+    if (T == void) return void;
+    if (abi.isBlockRefType(T)) return *const BlockLayout;
+    if (@typeInfo(T) == .optional and abi.isBlockRefType(@typeInfo(T).optional.child)) {
+        return ?*const BlockLayout;
+    }
+    return abi.UnwrapReturnType(T, true);
 }
 
-inline fn unwrapForBlockFn(comptime T: type, arg: T) cAbiBlockFnType(T) {
-    if (comptime WrapperUnderlying(T) != null) return arg.value;
-    if (comptime @typeInfo(T) == .optional) {
-        const Child = @typeInfo(T).optional.child;
-        if (comptime WrapperUnderlying(Child) != null) {
-            return if (arg) |unwrapped| unwrapped.value else null;
-        }
-        if (comptime isBlockRefType(Child)) {
-            return if (arg) |b| b.value else null;
-        }
-    }
-    return arg;
-}
-
-inline fn wrapFromBlockFn(comptime Return: type, raw: cAbiBlockFnType(Return)) Return {
-    if (Return == objc.Object) return objc.Object.fromId(raw);
-    if (comptime WrapperUnderlying(Return) != null) return Return{ .value = raw };
-    if (comptime @typeInfo(Return) == .optional) {
-        const Child = @typeInfo(Return).optional.child;
-        if (Child == objc.Object) return if (raw == null) null else objc.Object.fromId(raw);
-        if (comptime WrapperUnderlying(Child)) |V| {
-            if (comptime @typeInfo(V) == .optional or (@typeInfo(V) == .pointer and @typeInfo(V).pointer.size == .c)) {
-                return if (raw == null) null else Child{ .value = raw };
-            } else {
-                return if (raw) |ptr| Child{ .value = ptr } else null;
-            }
-        }
-        if (comptime isBlockRefType(Child)) {
-            return if (raw) |ptr| Child{ .value = ptr } else null;
-        }
-    }
-    return raw;
-}
-
-/// Maps `BlockRef` parameter/return types (including `bool` -> `c.BOOL` and `objc` wrappers)
-/// to their C-ABI counterparts when invoking arbitrary Objective-C blocks.
-fn unwrapBlockType(comptime T: type) type {
-    if (T == bool) return c.BOOL;
-    if (WrapperUnderlying(T)) |V| return V;
-
-    switch (@typeInfo(T)) {
-        .int, .float, .void, .@"enum", .vector => {},
-        .pointer => |p| {
-            if (p.size == .slice)
-                @compileError("BlockRef: " ++ @typeName(T) ++ " — Zig slices are not C-ABI compatible");
-        },
-        .optional => |opt| {
-            if (WrapperUnderlying(opt.child)) |V| return NullablePtr(V);
-            if (isBlockRefType(opt.child)) return ?*anyopaque;
-            if (@typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice)
-                @compileError("BlockRef: " ++ @typeName(T) ++ " — optional must wrap a pointer or objc wrapper");
-        },
-        .@"struct" => |s| {
-            if (s.layout != .@"extern" and s.layout != .@"packed")
-                @compileError("BlockRef: " ++ @typeName(T) ++ " — struct must be extern or packed");
-            if (s.layout == .@"packed" and @bitSizeOf(T) > 128)
-                @compileError("BlockRef: " ++ @typeName(T) ++ " — packed struct larger than 128 bits is not C-ABI compatible");
-        },
-        .@"union" => |u| {
-            if (u.layout != .@"extern")
-                @compileError("BlockRef: " ++ @typeName(T) ++ " — union must be extern");
-        },
-        else => @compileError("BlockRef: " ++ @typeName(T) ++ " — not C-ABI compatible"),
-    }
-    return T;
+fn makeSignatureFnType(comptime param_types: []const type, comptime Return: type) type {
+    var fn_params: [param_types.len + 1]type = undefined;
+    fn_params[0] = *const BlockLayout;
+    for (param_types, 1..) |Arg, i| fn_params[i] = signatureParamType(Arg);
+    return @Fn(&fn_params, &@splat(.{}), signatureReturnType(Return), .{ .@"callconv" = .c });
 }
 
 fn BlockRefInvokeFn(comptime param_types: []const type, comptime Return: type) type {
     var fn_params: [param_types.len + 1]type = undefined;
     fn_params[0] = *anyopaque;
-    for (param_types, 1..) |T, i| fn_params[i] = unwrapBlockType(T);
-    return @Fn(&fn_params, &@splat(.{}), unwrapBlockType(Return), .{ .@"callconv" = .c });
-}
-
-fn UnwrappedTuple(comptime param_types: []const type) type {
-    var types: [param_types.len]type = undefined;
-    for (param_types, 0..) |T, i| types[i] = unwrapBlockType(T);
-    return @Tuple(&types);
-}
-
-inline fn unwrapBlockArg(comptime T: type, arg: T) unwrapBlockType(T) {
-    if (T == bool) return cpkg.boolParam(arg);
-    if (comptime WrapperUnderlying(T) != null) return arg.value;
-    if (comptime @typeInfo(T) == .optional) {
-        const Child = @typeInfo(T).optional.child;
-        if (comptime WrapperUnderlying(Child) != null) {
-            return if (arg) |unwrapped| unwrapped.value else null;
-        }
-        if (comptime isBlockRefType(Child)) {
-            return if (arg) |b| b.value else null;
-        }
-    }
-    return arg;
-}
-
-inline fn wrapBlockReturn(comptime Return: type, raw: unwrapBlockType(Return)) Return {
-    if (Return == bool) return cpkg.boolResult(raw);
-    if (Return == objc.Object) return objc.Object.fromId(raw);
-    if (comptime WrapperUnderlying(Return) != null) return Return{ .value = raw };
-    if (comptime @typeInfo(Return) == .optional) {
-        const Child = @typeInfo(Return).optional.child;
-        if (Child == objc.Object) return if (raw == null) null else objc.Object.fromId(raw);
-        if (comptime WrapperUnderlying(Child)) |V| {
-            if (comptime @typeInfo(V) == .optional or (@typeInfo(V) == .pointer and @typeInfo(V).pointer.size == .c)) {
-                return if (raw == null) null else Child{ .value = raw };
-            } else {
-                return if (raw) |ptr| Child{ .value = ptr } else null;
-            }
-        }
-        if (comptime isBlockRefType(Child)) {
-            return if (raw) |ptr| Child{ .value = ptr } else null;
-        }
-    }
-    return raw;
+    for (param_types, 1..) |T, i| fn_params[i] = abi.UnwrapParamType(T, true);
+    return @Fn(&fn_params, &@splat(.{}), abi.UnwrapReturnType(Return, true), .{ .@"callconv" = .c });
 }
 
 /// This is the type of a block structure that is passed as the first
 /// argument to any block invocation. See Block.
-fn BlockContext(comptime Captures: type, comptime InvokeFn: type, comptime DescriptorType: type) type {
+fn BlockContext(
+    comptime Captures: type,
+    comptime InvokeFn: type,
+    comptime DescriptorType: type,
+    comptime needs_bool_trampoline: bool,
+) type {
     const captures_info = @typeInfo(Captures).@"struct";
-    if (captures_info.field_types.len == 0) {
+    if (captures_info.field_types.len == 0 and !needs_bool_trampoline) {
         return extern struct {
             pub const is_objc_block_context = true;
 
@@ -723,7 +818,8 @@ fn BlockContext(comptime Captures: type, comptime InvokeFn: type, comptime Descr
         };
     }
 
-    const field_count = captures_info.field_types.len + 5;
+    const extra_fields: usize = if (needs_bool_trampoline) 1 else 0;
+    const field_count = captures_info.field_types.len + 5 + extra_fields;
 
     var field_names: [field_count][]const u8 = undefined;
     var field_types: [field_count]type = undefined;
@@ -771,11 +867,6 @@ fn BlockContext(comptime Captures: type, comptime InvokeFn: type, comptime Descr
         captures_info.field_attrs,
         5..,
     ) |field_name, field_type, field_attr, i| {
-        switch (field_type) {
-            comptime_int => @compileError("capture should not be a comptime_int, try using @as"),
-            comptime_float => @compileError("capture should not be a comptime_float, try using @as"),
-            else => {},
-        }
         const StoredType = ContextFieldType(field_type);
         field_names[i] = field_name;
         field_types[i] = StoredType;
@@ -783,6 +874,17 @@ fn BlockContext(comptime Captures: type, comptime InvokeFn: type, comptime Descr
             .default_value_ptr = null,
             .@"comptime" = false,
             .@"align" = if (StoredType == field_type) field_attr.@"align" else @alignOf(StoredType),
+        };
+    }
+
+    if (needs_bool_trampoline) {
+        const fn_slot = 5 + captures_info.field_types.len;
+        field_names[fn_slot] = "__zig_objc_user_invoke";
+        field_types[fn_slot] = *const anyopaque;
+        field_attrs[fn_slot] = .{
+            .default_value_ptr = null,
+            .@"comptime" = false,
+            .@"align" = @alignOf(*anyopaque),
         };
     }
 
@@ -1419,6 +1521,146 @@ test "Block, BlockRef, and impImplementationWithBlock returning unaligned struct
     const msg_res = inst.msgSend(Unaligned9, "buildUnaligned:", .{@as(u8, 0x0F)});
     try testing.expectEqual(@as(u8, 0xF0), msg_res.a);
     try testing.expectEqual(@as(i64, -15_000_000_000), msg_res.b);
+}
+
+test "BlockRef.tryCopy, bool descriptor encoding, and extern Object/Sel signatures" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    // 1. Verify Block descriptor signature encodes `bool` as `@encode(BOOL)` (`c.BOOL`)
+    //    and nested BlockRef / ?BlockRef as `@?`.
+    const InnerBoolBlock = Block(struct {}, .{ i32, bool }, bool);
+    const expected_bool_enc = comptime objc.comptimeEncode(c.BOOL) ++ "@?i" ++ objc.comptimeEncode(c.BOOL);
+    try testing.expectEqualStrings(expected_bool_enc, &InnerBoolBlock.signature_encoding);
+
+    const global_bool = InnerBoolBlock.initGlobal(&(struct {
+        fn check(_: *const InnerBoolBlock.Context, x: i32, invert: bool) callconv(.c) bool {
+            const pos = x > 0;
+            return if (invert) !pos else pos;
+        }
+    }).check);
+    try testing.expectEqualStrings(expected_bool_enc, std.mem.span(global_bool.descriptor.signature.?));
+    try testing.expect(InnerBoolBlock.invoke(global_bool, .{ 5, false }));
+    try testing.expect(!InnerBoolBlock.invoke(global_bool, .{ 5, true }));
+    if (comptime c.BOOL != bool) {
+        // Simulate an Objective-C caller passing a non-0/1 signed char BOOL (e.g. 2 or -1).
+        try testing.expectEqual(@as(c.BOOL, 0), global_bool.invoke(global_bool, 5, @as(c.BOOL, 2)));
+        try testing.expectEqual(@as(c.BOOL, 1), global_bool.invoke(global_bool, -5, @as(c.BOOL, -1)));
+    }
+
+    const bool_ref = InnerBoolBlock.asBlockRef(global_bool);
+    const copied_bool_ref = try bool_ref.tryCopy();
+    defer copied_bool_ref.release();
+    try testing.expect(copied_bool_ref.invoke(.{ -3, true }));
+    try testing.expect(!copied_bool_ref.invoke(.{ -3, false }));
+
+    const HigherBlock = Block(struct {}, .{ InnerBoolBlock.Ref, ?InnerBoolBlock.Ref }, bool);
+    const expected_higher_enc = comptime objc.comptimeEncode(c.BOOL) ++ "@?@?@?";
+    try testing.expectEqualStrings(expected_higher_enc, &HigherBlock.signature_encoding);
+
+    // 2. Stack block copied via BlockRef.tryCopy() keeps captured object alive until release()
+    const NSString = objc.getClass("NSString").?;
+    const TargetAction = extern struct {
+        target: objc.Object,
+        action: objc.Sel,
+    };
+
+    const ActionBlock = Block(struct {
+        prefix: objc.Object,
+        fallback_sel: objc.Sel,
+        weak_ptr: *objc.Weak,
+    }, .{ objc.Object, objc.Sel, TargetAction }, TargetAction);
+
+    var weak_slot: objc.Weak = .{};
+    defer weak_slot.deinit();
+    const prefix = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"sel:"});
+    weak_slot.init(prefix);
+
+    const length_sel = objc.Sel.cached("length");
+    const desc_sel = objc.Sel.cached("description");
+
+    const heap_action_ref = blk: {
+        var stack_action = ActionBlock.init(.{
+            .prefix = prefix,
+            .fallback_sel = desc_sel,
+            .weak_ptr = &weak_slot,
+        }, &(struct {
+            fn run(
+                ctx: *const ActionBlock.Context,
+                raw_obj: c.id,
+                raw_sel: c.SEL,
+                pair: TargetAction,
+            ) callconv(.c) TargetAction {
+                const caps = ActionBlock.getCaptures(ctx);
+                const obj = objc.Object.fromId(raw_obj);
+                const incoming_sel = objc.Sel{ .value = raw_sel };
+                const loaded = caps.weak_ptr.loadRetained() orelse caps.prefix;
+                defer if (loaded.value == caps.prefix.value) loaded.release();
+                const chosen_sel = if (incoming_sel.isEqual(pair.action)) incoming_sel else caps.fallback_sel;
+                const combined = loaded.msgSend(objc.Object, "stringByAppendingString:", .{obj});
+                return .{ .target = combined, .action = chosen_sel };
+            }
+        }).run);
+
+        break :blk try ActionBlock.asBlockRef(&stack_action).tryCopy();
+    };
+    defer heap_action_ref.release();
+
+    const suffix = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"ok"});
+    const out_same = heap_action_ref.invoke(.{
+        suffix,
+        length_sel,
+        TargetAction{ .target = suffix, .action = length_sel },
+    });
+    try testing.expect(out_same.action.isEqual(length_sel));
+    try testing.expectEqualStrings(
+        "sel:ok",
+        std.mem.span(out_same.target.msgSend([*:0]const u8, "UTF8String", .{})),
+    );
+
+    const out_diff = heap_action_ref.invoke(.{
+        suffix,
+        length_sel,
+        TargetAction{ .target = suffix, .action = desc_sel },
+    });
+    try testing.expect(out_diff.action.isEqual(desc_sel));
+
+    // Also test direct Sel/Object return types on Block & BlockRef
+    const SelEchoBlock = Block(struct {}, .{ objc.Object, objc.Sel }, objc.Sel);
+    const sel_echo = SelEchoBlock.initGlobal(&(struct {
+        fn echo(_: *const SelEchoBlock.Context, raw_obj: c.id, raw_sel: c.SEL) callconv(.c) c.SEL {
+            _ = objc.Object.fromId(raw_obj);
+            return raw_sel;
+        }
+    }).echo);
+    try testing.expect(SelEchoBlock.invoke(sel_echo, .{ suffix, length_sel }).isEqual(length_sel));
+    try testing.expect(SelEchoBlock.asBlockRef(sel_echo).invoke(.{ suffix, desc_sel }).isEqual(desc_sel));
+
+    // Verify 16-byte aligned field and nested POD extern struct captures work cleanly
+    const NestedPod = extern struct {
+        scale: f32,
+        bias: f32,
+        sel_handle: objc.Sel,
+    };
+    const SimdPodBlock = Block(struct {
+        lanes: [4]f32 align(16),
+        pod: NestedPod,
+    }, .{f32}, f32);
+    var simd_stack = SimdPodBlock.init(.{
+        .lanes = .{ 1.0, 2.0, 3.0, 4.0 },
+        .pod = .{ .scale = 2.0, .bias = 0.5, .sel_handle = length_sel },
+    }, &(struct {
+        fn run(ctx: *const SimdPodBlock.Context, x: f32) callconv(.c) f32 {
+            const caps = SimdPodBlock.getCaptures(ctx);
+            const sum = caps.lanes[0] + caps.lanes[1] + caps.lanes[2] + caps.lanes[3];
+            return sum * caps.pod.scale + caps.pod.bias + x;
+        }
+    }).run);
+    const simd_heap = try SimdPodBlock.copy(&simd_stack);
+    defer SimdPodBlock.release(simd_heap);
+    try testing.expectEqual(@as(usize, 0), @intFromPtr(&simd_heap.lanes) % 16);
+    try testing.expectEqual(@as(f32, 22.0), SimdPodBlock.invoke(simd_heap, .{@as(f32, 1.5)}));
 }
 
 test {

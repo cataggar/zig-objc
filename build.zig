@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) !void {
     // Translate the Objective-C runtime headers once in the build so the Zig
     // code can import a stable generated module instead of invoking @cImport
     // from every compile.
-    const objc_c = try translateCModule(b, target, optimize);
+    const objc_c = try translateCModule(b, target);
 
     const objc = b.addModule("objc", .{
         .root_source_file = b.path("src/main.zig"),
@@ -42,6 +42,37 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run tests");
     const tests_run = b.addRunArtifact(tests);
     test_step.dependOn(&tests_run.step);
+
+    const bench_optimize: std.builtin.Optimize = if (b.user_input_options.contains("optimize") or b.graph.release_mode != .off)
+        optimize
+    else
+        .ReleaseFast;
+    const bench_objc = if (bench_optimize == optimize) objc else blk: {
+        const m = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+        });
+        try configureModule(b, m, objc_c, add_paths);
+        break :blk m;
+    };
+    const bench_root = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .link_libc = true,
+    });
+    bench_root.addImport("objc", bench_objc);
+    if (add_paths) try addAppleSDK(b, bench_root);
+    bench_root.linkFramework("Foundation", .{});
+    const bench_exe = b.addExecutable(.{
+        .name = "objc-bench",
+        .root_module = bench_root,
+    });
+
+    const bench_step = b.step("bench", "Run Objective-C runtime microbenchmarks");
+    const bench_run = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&bench_run.step);
 }
 
 fn configureModule(
@@ -55,7 +86,7 @@ fn configureModule(
     if (add_paths) try addAppleSDK(b, m);
     m.addCSourceFile(.{
         .file = b.path("src/exception_shim.m"),
-        .flags = &.{ "-x", "objective-c", "-fobjc-exceptions", "-fno-objc-arc" },
+        .flags = &.{ "-x", "objective-c", "-fobjc-exceptions", "-fno-objc-arc", "-funwind-tables" },
     });
     m.linkSystemLibrary("objc", .{});
     m.linkFramework("Foundation", .{});
@@ -70,7 +101,6 @@ fn configureModule(
 fn translateCModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
 ) !*std.Build.Module {
     const sdk_path = try appleSDKPath(b, target);
     const include_path = b.pathJoin(&.{ sdk_path, "/usr/include" });
@@ -120,7 +150,7 @@ fn translateCModule(
         .name = "objc-c",
         .c_source_file = import_h,
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
     });
     // Search the generated directory first so <objc/runtime.h> resolves to the
     // patched copy, while every other include still falls through to the SDK.

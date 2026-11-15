@@ -8,41 +8,79 @@ pub inline fn sel(name: [:0]const u8) Sel {
     return Sel.registerName(name);
 }
 
-pub const Sel = struct {
+pub const Sel = extern struct {
     value: c.SEL,
+
+    /// Looks up and caches `name` in a lock-free `.acquire`/`.release` atomic static slot
+    /// per comptime selector string (`sel_registerName` runs once on first call).
+    pub inline fn cached(comptime name: [:0]const u8) Sel {
+        const Cache = struct {
+            var slot: c.SEL = null;
+            noinline fn resolve() Sel {
+                @branchHint(.unlikely);
+                const resolved = c.sel_registerName(name.ptr);
+                @atomicStore(c.SEL, &slot, resolved, .release);
+                return .{ .value = resolved };
+            }
+        };
+        if (@atomicLoad(c.SEL, &Cache.slot, .acquire)) |ptr| {
+            return .{ .value = ptr };
+        }
+        return Cache.resolve();
+    }
 
     /// Registers a method with the Objective-C runtime system, maps the
     /// method name to a selector, and returns the selector value.
-    pub fn registerName(name: [:0]const u8) Sel {
+    pub inline fn registerName(name: [:0]const u8) Sel {
         return Sel{
             .value = c.sel_registerName(name.ptr),
         };
     }
 
     /// Registers a method name with the Objective-C runtime system.
-    pub fn getUid(str: [:0]const u8) Sel {
+    pub inline fn getUid(str: [:0]const u8) Sel {
         return Sel{
             .value = c.sel_getUid(str.ptr),
         };
     }
 
     /// Returns the name of the method specified by a given selector.
-    pub fn getName(self: Sel) [:0]const u8 {
+    pub inline fn getName(self: Sel) [:0]const u8 {
         return std.mem.span(c.sel_getName(self.value));
     }
 
     /// Returns true if the selector is valid and mapped in the runtime.
-    pub fn isMapped(self: Sel) bool {
+    pub inline fn isMapped(self: Sel) bool {
         return boolResult(c.sel_isMapped(self.value));
     }
 
     /// Returns true if two selectors are equal.
-    pub fn isEqual(self: Sel, other: Sel) bool {
+    pub inline fn isEqual(self: Sel, other: Sel) bool {
         return boolResult(c.sel_isEqual(self.value, other.value));
     }
 
     pub const eql = isEqual;
 };
+
+test "Sel extern layout and cached lookup" {
+    const testing = std.testing;
+
+    try testing.expectEqual(std.builtin.Type.ContainerLayout.@"extern", @typeInfo(Sel).@"struct".layout);
+    try testing.expectEqual(@sizeOf(c.SEL), @sizeOf(Sel));
+    try testing.expectEqual(@alignOf(c.SEL), @alignOf(Sel));
+
+    const expected_len = sel("length");
+    const cached_len_1 = Sel.cached("length");
+    const cached_len_2 = Sel.cached("length");
+    try testing.expectEqual(expected_len.value, cached_len_1.value);
+    try testing.expectEqual(expected_len.value, cached_len_2.value);
+    try testing.expect(cached_len_1.eql(expected_len));
+
+    // Distinct comptime strings of identical byte length (6 bytes) must use distinct slots.
+    const cached_retain = Sel.cached("retain");
+    try testing.expectEqual(sel("retain").value, cached_retain.value);
+    try testing.expect(!Sel.cached("length").eql(Sel.cached("retain")));
+}
 
 test "Sel runtime operations" {
     const testing = std.testing;

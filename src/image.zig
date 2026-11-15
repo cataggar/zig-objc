@@ -30,7 +30,7 @@ const SetHookLazyClassNamerFn = *const fn (HookLazyClassNamer, *HookLazyClassNam
 const AddLoadImageFuncFn = *const fn (LoadImageFunc) callconv(.c) void;
 
 /// Reports whether `objc_copyImageHeaders` is available in the running Objective-C runtime.
-pub fn hasCopyImageHeaders() bool {
+pub inline fn hasCopyImageHeaders() bool {
     return cpkg.weakExtern(?CopyImageHeadersFn, "objc_copyImageHeaders") != null;
 }
 
@@ -53,9 +53,11 @@ pub fn copyImageHeaders() []const *const MachHeader {
 
 /// Returns the path of the dynamic library or framework `cls` originated from
 /// (`class_getImageName`), or `null` if unavailable.
-pub fn getImageName(cls: objc.Class) ?[:0]const u8 {
-    const raw: ?[*:0]const u8 = c.class_getImageName(cls.value);
-    return std.mem.sliceTo(raw orelse return null, 0);
+pub inline fn getImageName(cls: objc.Class) ?[:0]const u8 {
+    const raw = c.class_getImageName(cls.value);
+    if (raw == null) return null;
+    const ptr: [*:0]const u8 = @ptrCast(raw);
+    return std.mem.span(ptr);
 }
 
 /// Returns the names of all Objective-C classes within `image`
@@ -79,14 +81,14 @@ pub const EnumerationMutationHandler = ?*const fn (c.id) callconv(.c) void;
 
 /// Installs the global enumeration mutation handler (`objc_setEnumerationMutationHandler`).
 /// Passing `null` restores the runtime's default fatal handler.
-pub fn setEnumerationMutationHandler(handler: EnumerationMutationHandler) void {
+pub inline fn setEnumerationMutationHandler(handler: EnumerationMutationHandler) void {
     c.objc_setEnumerationMutationHandler(handler);
 }
 
 /// Triggers an enumeration mutation notification for `obj` (`objc_enumerationMutation`).
 /// Note: aborts the process unless a custom handler has been installed via
 /// `setEnumerationMutationHandler`.
-pub fn enumerationMutation(obj: objc.Object) void {
+pub inline fn enumerationMutation(obj: objc.Object) void {
     c.objc_enumerationMutation(obj.value);
 }
 
@@ -97,7 +99,7 @@ else
     ?*const fn (c.Class, [*c][*c]const u8) callconv(.c) c.BOOL;
 
 /// Reports whether `objc_setHook_getImageName` is available in the running Objective-C runtime.
-pub fn hasSetHookGetImageName() bool {
+pub inline fn hasSetHookGetImageName() bool {
     return cpkg.weakExtern(?SetHookGetImageNameFn, "objc_setHook_getImageName") != null;
 }
 
@@ -121,7 +123,7 @@ else
     ?*const fn ([*c]const u8, [*c]c.Class) callconv(.c) c.BOOL;
 
 /// Reports whether `objc_setHook_getClass` is available in the running Objective-C runtime.
-pub fn hasSetHookGetClass() bool {
+pub inline fn hasSetHookGetClass() bool {
     return cpkg.weakExtern(?SetHookGetClassFn, "objc_setHook_getClass") != null;
 }
 
@@ -145,7 +147,7 @@ else
     ?*const fn (c.Class) callconv(.c) [*c]const u8;
 
 /// Reports whether `objc_setHook_lazyClassNamer` is available in the running Objective-C runtime.
-pub fn hasSetHookLazyClassNamer() bool {
+pub inline fn hasSetHookLazyClassNamer() bool {
     return cpkg.weakExtern(?SetHookLazyClassNamerFn, "objc_setHook_lazyClassNamer") != null;
 }
 
@@ -170,7 +172,7 @@ else
     ?*const fn (?*const MachHeader) callconv(.c) void;
 
 /// Reports whether `objc_addLoadImageFunc` is available in the running Objective-C runtime.
-pub fn hasAddLoadImageFunc() bool {
+pub inline fn hasAddLoadImageFunc() bool {
     return cpkg.weakExtern(?AddLoadImageFuncFn, "objc_addLoadImageFunc") != null;
 }
 
@@ -298,14 +300,14 @@ test "setHookGetClass intercepts unknown classes and preserves normal lookup" {
                     observed_delegate_lookup = true;
                 } else if (std.mem.eql(u8, slice, "ZigObjCNonExistentHookResolveClass_999")) {
                     observed_resolved_lookup = true;
-                    out_class.* = fallback_class;
+                    if (out_class != null) out_class.* = fallback_class;
                     return cpkg.boolParam(fallback_class != null);
                 }
             }
             if (old_hook) |prev| {
                 return prev(name, out_class);
             }
-            out_class.* = null;
+            if (out_class != null) out_class.* = null;
             return cpkg.boolParam(false);
         }
     };
@@ -363,13 +365,13 @@ test "setHookGetImageName intercepts target class and delegates others" {
 
         fn hook(cls: c.Class, out_image_name: [*c][*c]const u8) callconv(.c) c.BOOL {
             if (cls != null and cls == target_cls) {
-                out_image_name.* = custom_image.ptr;
+                if (out_image_name != null) out_image_name.* = custom_image.ptr;
                 return cpkg.boolParam(true);
             }
             if (old_hook) |prev| {
                 return prev(cls, out_image_name);
             }
-            out_image_name.* = null;
+            if (out_image_name != null) out_image_name.* = null;
             return cpkg.boolParam(false);
         }
     };

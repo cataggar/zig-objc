@@ -37,9 +37,13 @@ pub const Iterator = iterator.Iterator;
 // Selectors
 pub const Sel = selpkg.Sel;
 pub const sel = selpkg.sel;
+pub const selCached = selpkg.Sel.cached;
+pub const S = selpkg.Sel.cached;
 
 // Messaging & forwarding (<objc/message.h>)
 pub const MsgSend = msg_send.MsgSend;
+pub const msgSendVarargs = msg_send.msgSendVarargs;
+pub const msgSendSuperVarargs = msg_send.msgSendSuperVarargs;
 pub const msgForward = msg_send.msgForward;
 pub const msgForwardStret = msg_send.msgForwardStret;
 pub const setForwardHandler = msg_send.setForwardHandler;
@@ -56,6 +60,7 @@ pub const MethodTypeIterator = encoding.MethodTypeIterator;
 
 // Instance variables, methods, and properties (<objc/runtime.h>)
 pub const Ivar = ivar.Ivar;
+pub const IvarSlot = ivar.IvarSlot;
 pub const Method = method.Method;
 pub const MethodDescription = method.MethodDescription;
 pub const Property = property.Property;
@@ -70,6 +75,7 @@ pub const registerProtocol = protocol.registerProtocol;
 // Classes (<objc/runtime.h>)
 pub const Class = class.Class;
 pub const getClass = class.getClass;
+pub const getClassCached = class.getClassCached;
 pub const lookUpClass = class.lookUpClass;
 pub const getRequiredClass = class.getRequiredClass;
 pub const getMetaClass = class.getMetaClass;
@@ -124,6 +130,8 @@ pub const tryInvoke = exception.tryInvoke;
 pub const tryCall = exception.tryCall;
 pub const msgSendTry = exception.msgSendTry;
 pub const msgSendSuperTry = exception.msgSendSuperTry;
+pub const msgSendVarargsTry = exception.msgSendVarargsTry;
+pub const msgSendSuperVarargsTry = exception.msgSendSuperVarargsTry;
 pub const throw = exception.throw;
 pub const rethrow = exception.rethrow;
 pub const beginCatch = exception.beginCatch;
@@ -438,7 +446,152 @@ test "end-to-end integration: dynamic protocol, subclass, typed ivar, IMP-block,
     try testing.expect(weak_worker.loadRetained() == null);
 }
 
+test "end-to-end integration: S/selCached, getClassCached, IvarSlot, msgSendVarargs/Try, and typed (Object, Sel) IMP" {
+    const testing = std.testing;
+
+    const pool = AutoreleasePool.init();
+    defer pool.deinit();
+
+    // 1. Cached selectors (`S` & `selCached`) and cached framework classes (`getClassCached`)
+    try testing.expect(S("length").eql(selCached("length")));
+    try testing.expect(S("length").eql(sel("length")));
+
+    const NSObject = getClassCached("NSObject") orelse return error.ClassNotFound;
+    const NSString = getClassCached("NSString") orelse return error.ClassNotFound;
+    const NSMutableString = getClassCached("NSMutableString") orelse return error.ClassNotFound;
+    const NSArray = getClassCached("NSArray") orelse return error.ClassNotFound;
+    try testing.expectEqual(getClass("NSString").?.value, NSString.value);
+
+    // 2. Dynamic subclass with `*MyState` ivar and direct `(Object, Sel, ...)` `callconv(.c)` IMPs
+    const MyState = struct {
+        acc: i64,
+        last_sel_matched: bool = false,
+        dealloc_seen: bool = false,
+    };
+
+    const FastWorker = allocateClassPair(NSObject, "ZigObjcE2EFastWorker") orelse return error.ClassAllocFailed;
+    defer disposeClassPair(FastWorker);
+
+    try testing.expect(FastWorker.addIvar(*MyState, "zig_state"));
+
+    const Slots = struct {
+        var eager: IvarSlot(*MyState) = .{};
+    };
+
+    try testing.expect(FastWorker.addMethod("accumulateDelta:", struct {
+        fn imp(self_obj: Object, cmd: Sel, delta: i64) callconv(.c) i64 {
+            const st = Slots.eager.load(self_obj);
+            st.last_sel_matched = cmd.eql(S("accumulateDelta:"));
+            st.acc += delta;
+            return st.acc;
+        }
+    }.imp));
+
+    _ = FastWorker.replaceMethod("dealloc", struct {
+        fn imp(self_obj: Object, _: Sel) callconv(.c) void {
+            const st = Slots.eager.load(self_obj);
+            st.dealloc_seen = true;
+            self_obj.msgSendSuper(getClassCached("NSObject").?, void, S("dealloc"), .{});
+        }
+    }.imp);
+
+    registerClassPair(FastWorker);
+    Slots.eager = IvarSlot(*MyState).fromClass(FastWorker, "zig_state") orelse return error.SlotResolveFailed;
+
+    var state_a: MyState = .{ .acc = 100 };
+    var state_b: MyState = .{ .acc = 500 };
+    var lazy_slot: IvarSlot(*MyState) = .{};
+
+    {
+        const inst = allocInit(FastWorker) orelse return error.AllocInitFailed;
+        defer inst.release();
+
+        // Eager store + load, then invoke `(Object, Sel, i64)` IMP
+        Slots.eager.store(inst, &state_a);
+        try testing.expectEqual(&state_a, Slots.eager.load(inst));
+        try testing.expectEqual(@as(i64, 125), inst.msgSend(i64, S("accumulateDelta:"), .{@as(i64, 25)}));
+        try testing.expect(state_a.last_sel_matched);
+
+        // Lazy get + set swapping to `state_b`
+        try testing.expectEqual(&state_a, lazy_slot.get(inst, "zig_state").?);
+        try testing.expect(lazy_slot.set(inst, "zig_state", &state_b));
+        try testing.expectEqual(@as(i64, 507), inst.msgSend(i64, selCached("accumulateDelta:"), .{@as(i64, 7)}));
+        try testing.expect(state_b.last_sel_matched);
+    }
+    try testing.expect(state_b.dealloc_seen);
+
+    // 3. `cls.msgSendVarargs` & `obj.msgSendVarargs` (`+[NSString stringWithFormat:]`, `+[NSArray arrayWithObjects:]`, `-[NSMutableString appendFormat:]`)
+    const fmt = NSString.msgSend(Object, S("stringWithUTF8String:"), .{"%s=%d (%.1f)"});
+    const formatted = NSString.msgSendVarargs(
+        Object,
+        S("stringWithFormat:"),
+        .{fmt},
+        .{ "score", @as(c_int, 99), @as(f32, 4.5) },
+    );
+    try testing.expectEqualStrings("score=99 (4.5)", std.mem.span(formatted.msgSend([*:0]const u8, S("UTF8String"), .{})));
+
+    const second = NSString.msgSend(Object, S("stringWithUTF8String:"), .{"two"});
+    const arr = NSArray.msgSendVarargs(
+        Object,
+        S("arrayWithObjects:"),
+        .{formatted},
+        .{ second, null },
+    );
+    try testing.expectEqual(@as(usize, 2), arr.msgSend(usize, S("count"), .{}));
+
+    const mut_str = NSMutableString.msgSend(Object, S("stringWithUTF8String:"), .{"head"});
+    const tail_fmt = NSString.msgSend(Object, S("stringWithUTF8String:"), .{":%s:%d"});
+    mut_str.msgSendVarargs(void, S("appendFormat:"), .{tail_fmt}, .{ "tail", @as(u8, 3) });
+
+    // 4. `msgSendVarargsTry`: both `.ok` and `.exception` (`+[NSException raise:format:]` formats varargs and throws)
+    switch (mut_str.msgSendVarargsTry(void, S("appendFormat:"), .{tail_fmt}, .{ "ok", @as(c_int, 4) })) {
+        .ok => {},
+        .exception => return error.UnexpectedException,
+    }
+    try testing.expectEqualStrings(
+        "head:tail:3:ok:4",
+        std.mem.span(mut_str.msgSend([*:0]const u8, S("UTF8String"), .{})),
+    );
+
+    // Throwing `obj.msgSendVarargsTry` on an Object receiver (unrecognized variadic selector -> NSInvalidArgumentException)
+    switch (mut_str.msgSendVarargsTry(void, S("zigObjcUnrecognizedVarargSelector:"), .{@as(i64, 1)}, .{@as(c_int, 2)})) {
+        .ok => return error.ExpectedException,
+        .exception => |exc_opt| {
+            const exc = exc_opt orelse return error.NullException;
+            defer exc.release();
+            const exc_name = exc.msgSend(Object, S("name"), .{});
+            try testing.expectEqualStrings(
+                "NSInvalidArgumentException",
+                std.mem.span(exc_name.msgSend([*:0]const u8, S("UTF8String"), .{})),
+            );
+        },
+    }
+
+    // Throwing `cls.msgSendVarargsTry` (`+[NSException raise:format:]` formats varargs and throws)
+    const NSException = getClassCached("NSException") orelse return error.ClassNotFound;
+    const exc_name_in = NSString.msgSend(Object, S("stringWithUTF8String:"), .{"ZigVarargException"});
+    const exc_fmt_in = NSString.msgSend(Object, S("stringWithUTF8String:"), .{"code=%d tag=%s"});
+    switch (NSException.msgSendVarargsTry(void, S("raise:format:"), .{ exc_name_in, exc_fmt_in }, .{ @as(c_int, 404), "bad" })) {
+        .ok => return error.ExpectedException,
+        .exception => |exc_opt| {
+            const exc = exc_opt orelse return error.NullException;
+            defer exc.release();
+            const exc_name = exc.msgSend(Object, S("name"), .{});
+            const exc_reason = exc.msgSend(Object, S("reason"), .{});
+            try testing.expectEqualStrings(
+                "ZigVarargException",
+                std.mem.span(exc_name.msgSend([*:0]const u8, S("UTF8String"), .{})),
+            );
+            try testing.expectEqualStrings(
+                "code=404 tag=bad",
+                std.mem.span(exc_reason.msgSend([*:0]const u8, S("UTF8String"), .{})),
+            );
+        },
+    }
+}
+
 test {
+    _ = @import("abi.zig");
     _ = @import("autorelease.zig");
     _ = @import("block.zig");
     _ = @import("c.zig");

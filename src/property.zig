@@ -10,7 +10,7 @@ const PropertyAttribute = Attribute;
 
 /// Constructs an `Attribute` (`objc_property_attribute_t`) from sentinel-terminated
 /// `name` and `value` strings.
-pub fn attribute(name: [:0]const u8, value: [:0]const u8) PropertyAttribute {
+pub inline fn attribute(name: [:0]const u8, value: [:0]const u8) PropertyAttribute {
     return .{
         .name = name.ptr,
         .value = value.ptr,
@@ -30,14 +30,19 @@ pub const Property = extern struct {
     /// `name` and `value` strings.
     pub const attribute = propertyAttribute;
 
-    /// Returns the name of a property (`property_getName`).
-    pub fn getName(self: Property) [:0]const u8 {
-        return std.mem.span(c.property_getName(self.value));
+    /// Returns the name of a property, or `""` if `self.value` is `null` (`property_getName`).
+    pub inline fn getName(self: Property) [:0]const u8 {
+        if (self.value == null) return "";
+        const raw = c.property_getName(self.value);
+        if (raw == null) return "";
+        const ptr: [*:0]const u8 = @ptrCast(raw);
+        return std.mem.span(ptr);
     }
 
     /// Returns the raw Objective-C attribute string of a property, or `null` if
     /// unavailable (`property_getAttributes`).
-    pub fn getAttributes(self: Property) ?[:0]const u8 {
+    pub inline fn getAttributes(self: Property) ?[:0]const u8 {
+        if (self.value == null) return null;
         const raw = c.property_getAttributes(self.value);
         if (raw == null) return null;
         const ptr: [*:0]const u8 = @ptrCast(raw);
@@ -49,6 +54,7 @@ pub const Property = extern struct {
     ///
     /// Caller owns any non-null slice and must free it with `objc.free`.
     pub fn copyAttributeValue(self: Property, attr: [:0]const u8) ?[:0]u8 {
+        if (self.value == null) return null;
         const raw = c.property_copyAttributeValue(self.value, attr.ptr);
         if (raw == null) return null;
         const ptr: [*:0]u8 = @ptrCast(raw);
@@ -59,6 +65,7 @@ pub const Property = extern struct {
     ///
     /// Caller owns the returned slice and must free it with `objc.free`.
     pub fn copyAttributeList(self: Property) []PropertyAttribute {
+        if (self.value == null) return &.{};
         var count: c_uint = 0;
         const raw = c.property_copyAttributeList(self.value, &count);
         if (raw == null) return &.{};
@@ -162,6 +169,15 @@ test "Property.attribute helper with dynamic class property" {
     const copied_attrs = prop.copyAttributeList();
     defer objc.free(copied_attrs);
     try testing.expectEqual(@as(usize, 5), copied_attrs.len);
+
+    // Null property handle is handled safely without null-dereference UB.
+    const null_prop: Property = .{ .value = null };
+    try testing.expectEqualStrings("", null_prop.getName());
+    try testing.expect(null_prop.getAttributes() == null);
+    try testing.expect(null_prop.copyAttributeValue("T") == null);
+    const null_attr_list = null_prop.copyAttributeList();
+    defer objc.free(null_attr_list);
+    try testing.expectEqual(@as(usize, 0), null_attr_list.len);
 }
 
 test {

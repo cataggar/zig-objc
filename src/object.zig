@@ -1,12 +1,75 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const abi = @import("abi.zig");
 const cpkg = @import("c.zig");
 const c = cpkg.c;
 const boolResult = cpkg.boolResult;
 const objc = @import("main.zig");
-const Ivar = @import("ivar.zig").Ivar;
+const ivar_pkg = @import("ivar.zig");
+const Ivar = ivar_pkg.Ivar;
 const MsgSend = @import("msg_send.zig").MsgSend;
 const Iterator = @import("iterator.zig").Iterator;
 const sync = @import("sync.zig");
+
+const CustomSelectorAttr = union(enum) {
+    none,
+    stack: [:0]const u8,
+    overflow,
+};
+
+fn defaultSetterName(comptime n: [:0]const u8) *const [n.len + 4:0]u8 {
+    if (n.len == 0) @compileError("property name cannot be empty");
+    return comptime ("set" ++ [1]u8{std.ascii.toUpper(n[0])} ++ n[1..n.len] ++ ":");
+}
+
+/// Scans an Objective-C `property_getAttributes` string (`attrs`, e.g. `"Ti,GisReady,ScustomSet:,V_ready"`)
+/// for a comma-separated attribute starting with `code` (`'G'` or `'S'`), tracking `{...}`, `(...)`,
+/// `[...]`, and `"..."` nesting inside compound `T` type encodings (`T{Pair="a"i,"b"i}`, etc.).
+/// Copies the selector + NUL into `buf` with zero heap allocation unless a pathological selector
+/// exceeds 255 bytes (`.overflow`).
+fn findCustomSelectorAttr(attrs: [:0]const u8, code: u8, buf: *[256]u8) CustomSelectorAttr {
+    var i: usize = 0;
+    while (i < attrs.len) {
+        const seg_start = i;
+        var brace_depth: usize = 0;
+        var paren_depth: usize = 0;
+        var bracket_depth: usize = 0;
+        var in_quotes = false;
+        while (i < attrs.len) : (i += 1) {
+            const ch = attrs[i];
+            if (in_quotes) {
+                if (ch == '\\' and i + 1 < attrs.len) {
+                    i += 1;
+                } else if (ch == '"') {
+                    in_quotes = false;
+                }
+            } else {
+                switch (ch) {
+                    '"' => in_quotes = true,
+                    '{' => brace_depth += 1,
+                    '}' => brace_depth -|= 1,
+                    '(' => paren_depth += 1,
+                    ')' => paren_depth -|= 1,
+                    '[' => bracket_depth += 1,
+                    ']' => bracket_depth -|= 1,
+                    ',' => if (brace_depth == 0 and paren_depth == 0 and bracket_depth == 0) break,
+                    else => {},
+                }
+            }
+        }
+        const segment = attrs[seg_start..i];
+        if (i < attrs.len) i += 1;
+
+        if (segment.len > 1 and segment[0] == code) {
+            const sel_bytes = segment[1..];
+            if (sel_bytes.len >= buf.len) return .overflow;
+            @memcpy(buf[0..sel_bytes.len], sel_bytes);
+            buf[sel_bytes.len] = 0;
+            return .{ .stack = buf[0..sel_bytes.len :0] };
+        }
+    }
+    return .none;
+}
 
 /// Memory management policies for Objective-C associated objects (`objc_setAssociatedObject`).
 pub const AssociationPolicy = enum(c.objc_AssociationPolicy) {
@@ -20,7 +83,7 @@ pub const AssociationPolicy = enum(c.objc_AssociationPolicy) {
 const OuterAssociationPolicy = AssociationPolicy;
 
 /// Object is an instance of a class.
-pub const Object = struct {
+pub const Object = extern struct {
     value: c.id,
 
     pub const AssociationPolicy = OuterAssociationPolicy;
@@ -29,12 +92,16 @@ pub const Object = struct {
     const msg_send = MsgSend(Object);
     pub const msgSend = msg_send.msgSend;
     pub const msgSendSuper = msg_send.msgSendSuper;
+    pub const msgSendVarargs = msg_send.msgSendVarargs;
+    pub const msgSendSuperVarargs = msg_send.msgSendSuperVarargs;
     pub const msgSendTry = msg_send.msgSendTry;
     pub const msgSendSuperTry = msg_send.msgSendSuperTry;
+    pub const msgSendVarargsTry = msg_send.msgSendVarargsTry;
+    pub const msgSendSuperVarargsTry = msg_send.msgSendSuperVarargsTry;
 
     /// Convert a raw "id" into an Object. id must fit the size of the
     /// normal C "id" type (i.e. a `usize`).
-    pub fn fromId(id: anytype) Object {
+    pub inline fn fromId(id: anytype) Object {
         if (@sizeOf(@TypeOf(id)) != @sizeOf(c.id)) {
             @compileError("invalid id type");
         }
@@ -52,20 +119,33 @@ pub const Object = struct {
         return .{ .value = ptr };
     }
 
+    /// Returns `true` if `self` is an Objective-C tagged pointer (e.g. small `NSNumber`,
+    /// `NSString`, or `NSDate` encoded directly in the pointer bits), or `false` if `nil`
+    /// or heap-allocated.
+    pub inline fn isTaggedPointer(self: Object) bool {
+        if (self.value == null) return false;
+        const bits = @intFromPtr(self.value);
+        return switch (builtin.target.cpu.arch) {
+            .aarch64 => (bits & (@as(usize, 1) << 63)) != 0,
+            .x86_64 => (bits & 1) != 0,
+            else => (bits & (@alignOf(usize) - 1)) != 0,
+        };
+    }
+
     /// Allocates an uninitialized instance of `cls` via the fast `objc_alloc` runtime entry point.
-    pub fn alloc(cls: objc.Class) ?Object {
+    pub inline fn alloc(cls: objc.Class) ?Object {
         const raw = objc_alloc(cls.value);
         return if (raw == null) null else fromId(raw);
     }
 
     /// Allocates and initializes an instance of `cls` (`[[cls alloc] init]`) via `objc_alloc_init`.
-    pub fn allocInit(cls: objc.Class) ?Object {
+    pub inline fn allocInit(cls: objc.Class) ?Object {
         const raw = objc_alloc_init(cls.value);
         return if (raw == null) null else fromId(raw);
     }
 
     /// Returns the class of an object.
-    pub fn getClass(self: Object) ?objc.Class {
+    pub inline fn getClass(self: Object) ?objc.Class {
         return objc.Class{
             .value = c.object_getClass(self.value) orelse return null,
         };
@@ -73,6 +153,8 @@ pub const Object = struct {
 
     /// Sets the class of an object (`object_setClass`) and returns its previous class.
     pub fn setClass(self: Object, cls: objc.Class) ?objc.Class {
+        if (self.value == null) return null;
+        std.debug.assert(!self.isTaggedPointer());
         return objc.Class{
             .value = c.object_setClass(self.value, cls.value) orelse return null,
         };
@@ -85,55 +167,112 @@ pub const Object = struct {
 
     /// Returns a pointer to any extra bytes allocated with this instance (e.g. via `class_createInstance`).
     pub fn getIndexedIvars(self: Object) ?*anyopaque {
+        if (self.value == null) return null;
+        std.debug.assert(!self.isTaggedPointer());
         return c.object_getIndexedIvars(self.value);
     }
 
-    /// Set a property. This is a helper around getProperty and is
-    /// strictly less performant than doing it manually. Consider doing
-    /// this manually if performance is critical.
+    /// Sets a property on `self`, honoring custom `S<setter>` property attributes without
+    /// heap allocation, latching the first resolved `(Class, SEL)` pair in a lock-free
+    /// 1-class fast path, and resolving dynamically on polymorphic receivers.
+    /// Safely no-ops when `self` is `nil`.
     pub fn setProperty(self: Object, comptime n: [:0]const u8, v: anytype) void {
-        const Class = self.getClass().?;
-        const setter = setter: {
-            // See getProperty for why we do this.
-            if (Class.getProperty(n)) |prop| {
-                if (prop.copyAttributeValue("S")) |val| {
-                    defer objc.free(val);
-                    break :setter objc.sel(val);
-                }
-            }
+        if (comptime n.len == 0) @compileError("property name cannot be empty");
+        if (self.value == null) return;
+        const cls = self.getClass() orelse return;
 
-            break :setter objc.sel(
-                "set" ++
-                    [1]u8{std.ascii.toUpper(n[0])} ++
-                    n[1..n.len] ++
-                    ":",
-            );
+        const PropCache = struct {
+            var state: u8 = 0; // 0 = empty, 1 = filling, 2 = latched
+            var cached_cls: c.Class = null;
+            var cached_sel: c.SEL = null;
+
+            noinline fn resolveCold(target_cls: objc.Class) objc.Sel {
+                @branchHint(.unlikely);
+                var buf: [256]u8 = undefined;
+                const setter_sel: objc.Sel = setter: {
+                    if (target_cls.getProperty(n)) |prop| {
+                        if (prop.getAttributes()) |attrs| {
+                            switch (findCustomSelectorAttr(attrs, 'S', &buf)) {
+                                .stack => |val| break :setter objc.sel(val),
+                                .overflow => {
+                                    if (prop.copyAttributeValue("S")) |heap_val| {
+                                        defer objc.free(heap_val);
+                                        break :setter objc.sel(heap_val);
+                                    }
+                                },
+                                .none => {},
+                            }
+                        }
+                    }
+                    break :setter objc.Sel.cached(comptime defaultSetterName(n));
+                };
+                if (@cmpxchgStrong(u8, &state, 0, 1, .monotonic, .monotonic) == null) {
+                    cached_cls = target_cls.value;
+                    cached_sel = setter_sel.value;
+                    @atomicStore(u8, &state, 2, .release);
+                }
+                return setter_sel;
+            }
         };
 
-        self.msgSend(void, setter, .{v});
+        if (@atomicLoad(u8, &PropCache.state, .acquire) == 2 and PropCache.cached_cls == cls.value) {
+            self.msgSend(void, objc.Sel{ .value = PropCache.cached_sel }, .{v});
+            return;
+        }
+
+        self.msgSend(void, PropCache.resolveCold(cls), .{v});
     }
 
-    /// Get a property. This is a helper around Class.getProperty and is
-    /// strictly less performant than doing it manually. Consider doing
-    /// this manually if performance is critical.
+    /// Reads a property on `self`, honoring custom `G<getter>` property attributes without
+    /// heap allocation, latching the first resolved `(Class, SEL)` pair in a lock-free
+    /// 1-class fast path, and resolving dynamically on polymorphic receivers.
+    /// Safely returns Objective-C's zero/null `nil`-messaging result when `self` is `nil`.
     pub fn getProperty(self: Object, comptime T: type, comptime n: [:0]const u8) T {
-        const Class = self.getClass().?;
-        const getter = getter: {
-            // Sometimes a property is not a property because it has been
-            // overloaded or something. I've found numerous occasions the
-            // Apple docs are just wrong, so we try to read it as a property
-            // but if we can't then we just call it as-is.
-            if (Class.getProperty(n)) |prop| {
-                if (prop.copyAttributeValue("G")) |val| {
-                    defer objc.free(val);
-                    break :getter objc.sel(val);
-                }
-            }
+        if (comptime n.len == 0) @compileError("property name cannot be empty");
+        if (self.value == null) {
+            return self.msgSend(T, objc.Sel.cached(n), .{});
+        }
+        const cls = self.getClass() orelse return self.msgSend(T, objc.Sel.cached(n), .{});
 
-            break :getter objc.sel(n);
+        const PropCache = struct {
+            var state: u8 = 0; // 0 = empty, 1 = filling, 2 = latched
+            var cached_cls: c.Class = null;
+            var cached_sel: c.SEL = null;
+
+            noinline fn resolveCold(target_cls: objc.Class) objc.Sel {
+                @branchHint(.unlikely);
+                var buf: [256]u8 = undefined;
+                const getter_sel: objc.Sel = getter: {
+                    if (target_cls.getProperty(n)) |prop| {
+                        if (prop.getAttributes()) |attrs| {
+                            switch (findCustomSelectorAttr(attrs, 'G', &buf)) {
+                                .stack => |val| break :getter objc.sel(val),
+                                .overflow => {
+                                    if (prop.copyAttributeValue("G")) |heap_val| {
+                                        defer objc.free(heap_val);
+                                        break :getter objc.sel(heap_val);
+                                    }
+                                },
+                                .none => {},
+                            }
+                        }
+                    }
+                    break :getter objc.Sel.cached(n);
+                };
+                if (@cmpxchgStrong(u8, &state, 0, 1, .monotonic, .monotonic) == null) {
+                    cached_cls = target_cls.value;
+                    cached_sel = getter_sel.value;
+                    @atomicStore(u8, &state, 2, .release);
+                }
+                return getter_sel;
+            }
         };
 
-        return self.msgSend(T, getter, .{});
+        if (@atomicLoad(u8, &PropCache.state, .acquire) == 2 and PropCache.cached_cls == cls.value) {
+            return self.msgSend(T, objc.Sel{ .value = PropCache.cached_sel }, .{});
+        }
+
+        return self.msgSend(T, PropCache.resolveCold(cls), .{});
     }
 
     pub fn copy(self: Object, size: usize) Object {
@@ -200,19 +339,42 @@ pub const Object = struct {
         }
     }
 
-    /// Returns a direct pointer to a non-object instance variable (`*MyZigState`, `usize`, `f64`, `extern struct`, etc.)
-    /// computed from `ivar.getOffset()`.
+    /// Returns a direct unaligned (`*align(1) T`) pointer to a non-object instance variable
+    /// (`*MyZigState`, `usize`, `f64`, `extern struct`, etc.) computed from `ivar.getOffset()`.
+    /// Prefer `getIvarPtrAligned` or `IvarSlot(T)` when the ivar has natural `@alignOf(T)` alignment.
     ///
     /// Objective-C object ivars (`Object` / `?Object` / `c.id`) must use `getIvar` / `setIvar` instead.
-    pub fn getIvarPtr(self: Object, comptime T: type, ivar: Ivar) *align(1) T {
-        if (T == Object or T == ?Object or T == c.id) {
-            @compileError("Objective-C object ivars must use Object.getIvar / Object.setIvar / Object.setIvarWithStrongDefault instead of direct byte-offset pointers");
-        }
+    pub inline fn getIvarPtr(self: Object, comptime T: type, ivar: Ivar) *align(1) T {
+        comptime ivar_pkg.validateDirectIvarType(T);
         std.debug.assert(self.value != null);
+        std.debug.assert(!self.isTaggedPointer());
         std.debug.assert(ivar.value != null);
-        const base: [*]u8 = @ptrCast(self.value.?);
-        const offset: usize = @intCast(ivar.getOffset());
-        return @ptrCast(base + offset);
+        const offset = ivar.getOffset();
+        std.debug.assert(offset >= 0);
+        const addr = @intFromPtr(self.value) +% @as(usize, @bitCast(offset));
+        return @ptrFromInt(addr);
+    }
+
+    /// Returns a naturally aligned `*T` pointer to a non-object instance variable at byte `offset`
+    /// from `self`, asserting non-null, non-tagged `self` and natural alignment of `T` in safe modes.
+    pub inline fn getIvarPtrAtOffset(self: Object, comptime T: type, offset: isize) *T {
+        comptime ivar_pkg.validateDirectIvarType(T);
+        std.debug.assert(self.value != null);
+        std.debug.assert(!self.isTaggedPointer());
+        std.debug.assert(offset >= 0);
+        const addr = @intFromPtr(self.value) +% @as(usize, @bitCast(offset));
+        if (comptime @alignOf(T) > 1) {
+            std.debug.assert((addr & (@alignOf(T) - 1)) == 0);
+        }
+        return @ptrFromInt(addr);
+    }
+
+    /// Returns a naturally aligned `*T` pointer to a non-object instance variable `ivar`,
+    /// asserting non-null, non-tagged `self` and natural alignment of `T` in safe modes.
+    pub inline fn getIvarPtrAligned(self: Object, comptime T: type, ivar: Ivar) *T {
+        comptime ivar_pkg.validateDirectIvarType(T);
+        std.debug.assert(ivar.value != null);
+        return self.getIvarPtrAtOffset(T, ivar.getOffset());
     }
 
     /// Reads an instance variable of type `T`, routing `Object`/`?Object`/`c.id` through `object_getIvar`
@@ -243,8 +405,12 @@ pub const Object = struct {
     }
 
     /// Looks up the instance variable `name` on `self`'s class and reads its typed value.
-    /// Returns `null` if `self` is `nil`, the ivar is not found, or `T == Object` and the ivar holds `nil`.
+    /// Returns `null` if `self` is `nil`, a tagged pointer, the ivar is not found, or `T == Object` and the ivar holds `nil`.
     pub fn getTypedIvar(self: Object, comptime T: type, name: [:0]const u8) ?T {
+        if (T != Object and T != c.id) {
+            comptime ivar_pkg.validateDirectIvarType(T);
+        }
+        if (self.value == null or self.isTaggedPointer()) return null;
         const cls = c.object_getClass(self.value) orelse return null;
         const raw_ivar = c.class_getInstanceVariable(cls, name.ptr) orelse return null;
         const ivar: Ivar = .{ .value = raw_ivar };
@@ -253,8 +419,12 @@ pub const Object = struct {
     }
 
     /// Looks up the instance variable `name` on `self`'s class and writes `val`.
-    /// Returns `false` if `self` is `nil` or no ivar named `name` exists on `self`'s class.
+    /// Returns `false` if `self` is `nil`, a tagged pointer, or no ivar named `name` exists on `self`'s class.
     pub fn setTypedIvar(self: Object, comptime T: type, name: [:0]const u8, val: T) bool {
+        if (T != Object and T != c.id) {
+            comptime ivar_pkg.validateDirectIvarType(T);
+        }
+        if (self.value == null or self.isTaggedPointer()) return false;
         const cls = c.object_getClass(self.value) orelse return false;
         const raw_ivar = c.class_getInstanceVariable(cls, name.ptr) orelse return false;
         self.setIvarValue(T, .{ .value = raw_ivar }, val);
@@ -295,41 +465,41 @@ pub const Object = struct {
         return sync.synchronize(self);
     }
 
-    pub fn retain(self: Object) Object {
+    pub inline fn retain(self: Object) Object {
         return fromId(objc_retain(self.value));
     }
 
-    pub fn release(self: Object) void {
+    pub inline fn release(self: Object) void {
         objc_release(self.value);
     }
 
     /// Adds `self` to the current `AutoreleasePool` (`objc_autorelease`).
-    pub fn autorelease(self: Object) Object {
+    pub inline fn autorelease(self: Object) Object {
         return fromId(objc_autorelease(self.value));
     }
 
     /// Retains `self` and adds it to the current `AutoreleasePool` (`objc_retainAutorelease`).
-    pub fn retainAutorelease(self: Object) Object {
+    pub inline fn retainAutorelease(self: Object) Object {
         return fromId(objc_retainAutorelease(self.value));
     }
 
     /// Claims/retains a value returned from an autoreleasing Objective-C call (`objc_retainAutoreleasedReturnValue`).
-    pub fn retainAutoreleasedReturnValue(self: Object) Object {
+    pub inline fn retainAutoreleasedReturnValue(self: Object) Object {
         return fromId(objc_retainAutoreleasedReturnValue(self.value));
     }
 
     /// Retains `self` and prepares it for ARC autoreleased return handoff (`objc_retainAutoreleaseReturnValue`).
-    pub fn retainAutoreleaseReturnValue(self: Object) Object {
+    pub inline fn retainAutoreleaseReturnValue(self: Object) Object {
         return fromId(objc_retainAutoreleaseReturnValue(self.value));
     }
 
     /// Claims an autoreleased return value without retaining (`objc_unsafeClaimAutoreleasedReturnValue`).
-    pub fn unsafeClaimAutoreleasedReturnValue(self: Object) Object {
+    pub inline fn unsafeClaimAutoreleasedReturnValue(self: Object) Object {
         return fromId(objc_unsafeClaimAutoreleasedReturnValue(self.value));
     }
 
     /// Atomically retains `new_val`, stores it into `slot`, and releases the previous value (`objc_storeStrong`).
-    pub fn storeStrong(slot: *?Object, new_val: ?Object) void {
+    pub inline fn storeStrong(slot: *?Object, new_val: ?Object) void {
         var raw: c.id = if (slot.*) |prev| prev.value else null;
         const next_raw: c.id = if (new_val) |v| v.value else null;
         objc_storeStrong(&raw, next_raw);
@@ -338,7 +508,7 @@ pub const Object = struct {
 
     /// Return an iterator for this object. The object must implement the
     /// `NSFastEnumeration` protocol.
-    pub fn iterate(self: Object) Iterator {
+    pub inline fn iterate(self: Object) Iterator {
         return Iterator.init(self);
     }
 };
@@ -820,7 +990,7 @@ test "Object copy, dispose, isClass, setInstanceVariable, and synchronize" {
 
     // setInstanceVariable + getInstanceVariable
     const Holder = objc.allocateClassPair(NSObject, "ZigObjcInstVarHolder").?;
-    try testing.expect(Holder.addIvar(?Object, "slot"));
+    try testing.expect(Holder.addIvar(Object, "slot"));
     objc.registerClassPair(Holder);
     defer objc.disposeClassPair(Holder);
 
@@ -836,4 +1006,252 @@ test "Object copy, dispose, isClass, setInstanceVariable, and synchronize" {
     defer outer_guard.unlock();
     var inner_guard = try inst.synchronize();
     inner_guard.unlock();
+}
+
+test "isTaggedPointer, nil guards, and getIvarPtrAligned" {
+    const testing = std.testing;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSObject = objc.getClass("NSObject").?;
+    const NSNumber = objc.getClass("NSNumber").?;
+
+    const nil_obj: Object = .{ .value = null };
+    try testing.expect(!nil_obj.isTaggedPointer());
+    try testing.expect(nil_obj.setClass(NSObject) == null);
+    try testing.expect(nil_obj.getIndexedIvars() == null);
+
+    const heap_obj = Object.allocInit(NSObject).?;
+    defer heap_obj.release();
+    try testing.expect(!heap_obj.isTaggedPointer());
+
+    const tagged_num = NSNumber.msgSend(Object, "numberWithInt:", .{@as(c_int, 42)});
+    try testing.expect(tagged_num.isTaggedPointer());
+    try testing.expect(tagged_num.getTypedIvar(usize, "isa") == null);
+    try testing.expect(!tagged_num.setTypedIvar(usize, "isa", 0));
+
+    const Vec2 = extern struct {
+        x: f64,
+        y: f64,
+    };
+
+    const AlignedCls = objc.allocateClassPair(NSObject, "ZigObjcAlignedIvarTest").?;
+    defer objc.disposeClassPair(AlignedCls);
+    try testing.expect(AlignedCls.addIvar(Vec2, "vec"));
+    objc.registerClassPair(AlignedCls);
+
+    const vec_ivar = AlignedCls.getInstanceVariable("vec").?;
+    const aligned_inst = Object.allocInit(AlignedCls).?;
+    defer aligned_inst.release();
+
+    const vec_ptr: *Vec2 = aligned_inst.getIvarPtrAligned(Vec2, vec_ivar);
+    try testing.expectEqual(*Vec2, @TypeOf(aligned_inst.getIvarPtrAligned(Vec2, vec_ivar)));
+    vec_ptr.* = .{ .x = 4.5, .y = -8.25 };
+
+    const via_offset = aligned_inst.getIvarPtrAtOffset(Vec2, vec_ivar.getOffset());
+    try testing.expectEqual(Vec2{ .x = 4.5, .y = -8.25 }, via_offset.*);
+}
+
+test "getProperty and setProperty: nil safety, default cached selectors, and zero-malloc custom G/S attributes" {
+    const testing = std.testing;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const Rect = extern struct {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    };
+
+    // 1. Nil receiver safety (no panic; zero/null return for scalars, ?Object, Object, and stret structs)
+    const nil_obj: Object = .{ .value = null };
+    nil_obj.setProperty("count", @as(u64, 99));
+    try testing.expectEqual(@as(u64, 0), nil_obj.getProperty(u64, "count"));
+    try testing.expect(nil_obj.getProperty(?Object, "description") == null);
+    try testing.expect(nil_obj.getProperty(Object, "description").value == null);
+    try testing.expectEqual(Rect{ .x = 0, .y = 0, .w = 0, .h = 0 }, nil_obj.getProperty(Rect, "frame"));
+
+    // 2. Dynamic class with default property, 1-char property, and custom G/S property
+    const NSObject = objc.getClass("NSObject").?;
+    const PropCls = objc.allocateClassPair(NSObject, "ZigObjcZeroAllocPropTest").?;
+    defer objc.disposeClassPair(PropCls);
+
+    try testing.expect(PropCls.addIvar(u64, "_score"));
+    try testing.expect(PropCls.addIvar(i32, "_x"));
+    try testing.expect(PropCls.addIvar(bool, "_ready"));
+
+    const default_attrs = [_]objc.Property.Attribute{
+        objc.Property.attribute("T", "Q"),
+        objc.Property.attribute("N", ""),
+        objc.Property.attribute("V", "_score"),
+    };
+    try testing.expect(PropCls.addProperty("score", &default_attrs));
+
+    // Custom G/S with a type attribute containing embedded commas inside `{...}` to verify scanner robustness
+    const custom_attrs = [_]objc.Property.Attribute{
+        objc.Property.attribute("T", "{Pair<int,Gfake>=ii}"),
+        objc.Property.attribute("N", ""),
+        objc.Property.attribute("G", "fetchReadyFlag"),
+        objc.Property.attribute("S", "applyReadyFlag:"),
+        objc.Property.attribute("V", "_ready"),
+    };
+    try testing.expect(PropCls.addProperty("ready", &custom_attrs));
+
+    // Pathological > 255-byte custom getter selector to exercise the .overflow fallback path
+    const long_getter_name: [:0]const u8 = "zigObjcCustomGetter_" ++ @as([245]u8, @splat('a')) ++ "";
+    comptime std.debug.assert(long_getter_name.len == 265);
+    const long_attrs = [_]objc.Property.Attribute{
+        objc.Property.attribute("T", "Q"),
+        objc.Property.attribute("R", ""),
+        objc.Property.attribute("G", long_getter_name),
+    };
+    try testing.expect(PropCls.addProperty("longProp", &long_attrs));
+
+    try testing.expect(PropCls.addMethod("score", struct {
+        fn imp(target: c.id, _: c.SEL) callconv(.c) u64 {
+            return Object.fromId(target).getTypedIvar(u64, "_score") orelse 0;
+        }
+    }.imp));
+    try testing.expect(PropCls.addMethod("setScore:", struct {
+        fn imp(target: c.id, _: c.SEL, v: u64) callconv(.c) void {
+            _ = Object.fromId(target).setTypedIvar(u64, "_score", v);
+        }
+    }.imp));
+
+    // Undeclared 1-char property ("x" -> "setX:")
+    try testing.expect(PropCls.addMethod("x", struct {
+        fn imp(target: c.id, _: c.SEL) callconv(.c) i32 {
+            return Object.fromId(target).getTypedIvar(i32, "_x") orelse 0;
+        }
+    }.imp));
+    try testing.expect(PropCls.addMethod("setX:", struct {
+        fn imp(target: c.id, _: c.SEL, v: i32) callconv(.c) void {
+            _ = Object.fromId(target).setTypedIvar(i32, "_x", v);
+        }
+    }.imp));
+
+    // Custom getter/setter IMPs
+    try testing.expect(PropCls.addMethod("fetchReadyFlag", struct {
+        fn imp(target: c.id, _: c.SEL) callconv(.c) c.BOOL {
+            const flag = Object.fromId(target).getTypedIvar(bool, "_ready") orelse false;
+            return cpkg.boolParam(flag);
+        }
+    }.imp));
+    try testing.expect(PropCls.addMethod("applyReadyFlag:", struct {
+        fn imp(target: c.id, _: c.SEL, v: c.BOOL) callconv(.c) void {
+            _ = Object.fromId(target).setTypedIvar(bool, "_ready", boolResult(v));
+        }
+    }.imp));
+    try testing.expect(PropCls.addMethod(long_getter_name, struct {
+        fn imp(_: c.id, _: c.SEL) callconv(.c) u64 {
+            return 0xCAFE_BABE;
+        }
+    }.imp));
+
+    objc.registerClassPair(PropCls);
+
+    const inst = Object.allocInit(PropCls).?;
+    defer inst.release();
+
+    // Default declared property ("score" / "setScore:")
+    inst.setProperty("score", @as(u64, 777));
+    try testing.expectEqual(@as(u64, 777), inst.getProperty(u64, "score"));
+
+    // Undeclared 1-char property ("x" / "setX:")
+    inst.setProperty("x", @as(i32, -42));
+    try testing.expectEqual(@as(i32, -42), inst.getProperty(i32, "x"));
+
+    // Custom G/S property ("fetchReadyFlag" / "applyReadyFlag:")
+    try testing.expect(!inst.getProperty(bool, "ready"));
+    inst.setProperty("ready", true);
+    try testing.expect(inst.getProperty(bool, "ready"));
+    inst.setProperty("ready", false);
+    try testing.expect(!inst.getProperty(bool, "ready"));
+
+    // > 255-byte custom getter overflow fallback
+    try testing.expectEqual(@as(u64, 0xCAFE_BABE), inst.getProperty(u64, "longProp"));
+
+    // 3. Bracket/quote-aware scanner on compound struct/union/vector encodings + nil sret safety
+    var scan_buf: [256]u8 = undefined;
+    switch (findCustomSelectorAttr("T{Pair=\"a,Gbad\"i,\"b\"i},GcustomGet,V_pair", 'G', &scan_buf)) {
+        .stack => |s| try testing.expectEqualStrings("customGet", s),
+        else => return error.ExpectedCustomGetter,
+    }
+    switch (findCustomSelectorAttr("T{Bits<(8>>1),Gfake>=i},N,GrealGet,V_bits", 'G', &scan_buf)) {
+        .stack => |s| try testing.expectEqualStrings("realGet", s),
+        else => return error.ExpectedCustomGetter,
+    }
+    switch (findCustomSelectorAttr("T(Uni=\"x\"i,\"y\"d),ScustomSet:,V_u", 'S', &scan_buf)) {
+        .stack => |s| try testing.expectEqualStrings("customSet:", s),
+        else => return error.ExpectedCustomSetter,
+    }
+    switch (findCustomSelectorAttr("T![16,16f],GvecGet,V_vec", 'G', &scan_buf)) {
+        .stack => |s| try testing.expectEqualStrings("vecGet", s),
+        else => return error.ExpectedCustomGetter,
+    }
+
+    const BigInts = extern struct { a: u64, b: u64, c: u64, d: u64 };
+    try testing.expectEqual(BigInts{ .a = 0, .b = 0, .c = 0, .d = 0 }, nil_obj.getProperty(BigInts, "bigInts"));
+
+    // 4. Polymorphic 1-class PropCache latch hit + dynamic fallback on second class
+    const PolyA = objc.allocateClassPair(NSObject, "ZigObjcPolyPropA").?;
+    defer objc.disposeClassPair(PolyA);
+    try testing.expect(PolyA.addIvar(i64, "_val"));
+    try testing.expect(PolyA.addMethod("polyVal", struct {
+        fn imp(target: c.id, _: c.SEL) callconv(.c) i64 {
+            return Object.fromId(target).getTypedIvar(i64, "_val") orelse 0;
+        }
+    }.imp));
+    try testing.expect(PolyA.addMethod("setPolyVal:", struct {
+        fn imp(target: c.id, _: c.SEL, v: i64) callconv(.c) void {
+            _ = Object.fromId(target).setTypedIvar(i64, "_val", v);
+        }
+    }.imp));
+    objc.registerClassPair(PolyA);
+
+    const PolyB = objc.allocateClassPair(NSObject, "ZigObjcPolyPropB").?;
+    defer objc.disposeClassPair(PolyB);
+    try testing.expect(PolyB.addIvar(i64, "_val"));
+    const poly_b_attrs = [_]objc.Property.Attribute{
+        objc.Property.attribute("T", "q"),
+        objc.Property.attribute("N", ""),
+        objc.Property.attribute("G", "fetchPolyB"),
+        objc.Property.attribute("S", "assignPolyB:"),
+        objc.Property.attribute("V", "_val"),
+    };
+    try testing.expect(PolyB.addProperty("polyVal", &poly_b_attrs));
+    try testing.expect(PolyB.addMethod("fetchPolyB", struct {
+        fn imp(target: c.id, _: c.SEL) callconv(.c) i64 {
+            return (Object.fromId(target).getTypedIvar(i64, "_val") orelse 0) + 1000;
+        }
+    }.imp));
+    try testing.expect(PolyB.addMethod("assignPolyB:", struct {
+        fn imp(target: c.id, _: c.SEL, v: i64) callconv(.c) void {
+            _ = Object.fromId(target).setTypedIvar(i64, "_val", v * 2);
+        }
+    }.imp));
+    objc.registerClassPair(PolyB);
+
+    const poly_helpers = struct {
+        fn writeProp(o: Object, v: i64) void {
+            o.setProperty("polyVal", v);
+        }
+        fn readProp(o: Object) i64 {
+            return o.getProperty(i64, "polyVal");
+        }
+    };
+
+    const inst_a = Object.allocInit(PolyA).?;
+    defer inst_a.release();
+    const inst_b = Object.allocInit(PolyB).?;
+    defer inst_b.release();
+
+    // First call latches PolyA (`polyVal` / `setPolyVal:`), subsequent PolyB calls at the
+    // exact same callsite fall back dynamically to `fetchPolyB` / `assignPolyB:`.
+    poly_helpers.writeProp(inst_a, 21);
+    try testing.expectEqual(@as(i64, 21), poly_helpers.readProp(inst_a));
+    poly_helpers.writeProp(inst_b, 21);
+    try testing.expectEqual(@as(i64, 1042), poly_helpers.readProp(inst_b));
+    try testing.expectEqual(@as(i64, 21), poly_helpers.readProp(inst_a));
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const abi = @import("abi.zig");
 const block_pkg = @import("block.zig");
 const cpkg = @import("c.zig");
 const c = cpkg.c;
@@ -19,27 +20,42 @@ pub const Class = extern struct {
     const msg_send = MsgSend(Class);
     pub const msgSend = msg_send.msgSend;
     pub const msgSendSuper = msg_send.msgSendSuper;
+    pub const msgSendVarargs = msg_send.msgSendVarargs;
+    pub const msgSendSuperVarargs = msg_send.msgSendSuperVarargs;
     pub const msgSendTry = msg_send.msgSendTry;
     pub const msgSendSuperTry = msg_send.msgSendSuperTry;
+    pub const msgSendVarargsTry = msg_send.msgSendVarargsTry;
+    pub const msgSendSuperVarargsTry = msg_send.msgSendSuperVarargsTry;
+
+    /// Looks up and caches the permanent/framework `Class` named `name` in a lock-free
+    /// `.acquire`/`.release` atomic static slot per comptime class name (`objc_getClass`
+    /// runs once on first call, caching both existing classes and `null` for missing classes).
+    ///
+    /// Intended only for permanent/framework classes (such as `"NSString"`), **not**
+    /// dynamically created classes that may later be destroyed with `disposeClassPair`.
+    pub const cached = getClassCached;
 
     /// Returns the name of this class, or `""` if `self.value` is `null` (`class_getName`).
-    pub fn getName(self: Class) [:0]const u8 {
-        return std.mem.span(c.class_getName(self.value));
+    pub inline fn getName(self: Class) [:0]const u8 {
+        const raw = c.class_getName(self.value);
+        if (raw == null) return "";
+        const ptr: [*:0]const u8 = @ptrCast(raw);
+        return std.mem.span(ptr);
     }
 
     /// Returns the superclass of this class, or `null` if this is a root class or `Nil`
     /// (`class_getSuperclass`).
-    pub fn getSuperclass(self: Class) ?Class {
+    pub inline fn getSuperclass(self: Class) ?Class {
         return .{ .value = c.class_getSuperclass(self.value) orelse return null };
     }
 
     /// Returns true if this class object is a metaclass (`class_isMetaClass`).
-    pub fn isMetaClass(self: Class) bool {
+    pub inline fn isMetaClass(self: Class) bool {
         return boolResult(c.class_isMetaClass(self.value));
     }
 
     /// Returns the size in bytes of instances of this class (`class_getInstanceSize`).
-    pub fn getInstanceSize(self: Class) usize {
+    pub inline fn getInstanceSize(self: Class) usize {
         return c.class_getInstanceSize(self.value);
     }
 
@@ -139,12 +155,12 @@ pub const Class = extern struct {
     }
 
     /// Returns true if instances of `self` respond to `sel_or_name` (`class_respondsToSelector`).
-    pub fn respondsToSelector(self: Class, sel_or_name: anytype) bool {
+    pub inline fn respondsToSelector(self: Class, sel_or_name: anytype) bool {
         return boolResult(c.class_respondsToSelector(self.value, resolveSel(sel_or_name).value));
     }
 
     /// Returns true if `self` directly conforms to `protocol` (`class_conformsToProtocol`).
-    pub fn conformsToProtocol(self: Class, protocol: objc.Protocol) bool {
+    pub inline fn conformsToProtocol(self: Class, protocol: objc.Protocol) bool {
         return boolResult(c.class_conformsToProtocol(self.value, protocol.value));
     }
 
@@ -249,7 +265,7 @@ pub const Class = extern struct {
 
     /// Creates a `+1` retained instance of `self` with `extra_bytes` of trailing indexed ivar
     /// storage (`class_createInstance`).
-    pub fn createInstance(self: Class, extra_bytes: usize) ?objc.Object {
+    pub inline fn createInstance(self: Class, extra_bytes: usize) ?objc.Object {
         const raw = c.class_createInstance(self.value, extra_bytes);
         if (raw == null) return null;
         return objc.Object.fromId(raw);
@@ -269,7 +285,7 @@ pub const Class = extern struct {
     /// returning the previous `IMP` or `null` (`class_replaceMethod`).
     ///
     /// `imp` must be a `callconv(.c)` function or function pointer whose first two
-    /// parameters are `(c.id` / `c.Class` / `Class, c.SEL)`.
+    /// parameters are `(objc.Object` / `c.id` / `Class` / `c.Class` / `?*anyopaque` / `*anyopaque, objc.Sel` / `c.SEL)`.
     pub fn replaceMethod(self: Class, sel_or_name: anytype, imp: anytype) c.IMP {
         const Imp = @TypeOf(imp);
         const Fn = switch (@typeInfo(Imp)) {
@@ -280,12 +296,7 @@ pub const Class = extern struct {
                 @compileError("Class.replaceMethod expected a function or function pointer, got " ++ @typeName(Imp)),
             else => @compileError("Class.replaceMethod expected a function or function pointer, got " ++ @typeName(Imp)),
         };
-        const fn_info = @typeInfo(Fn).@"fn";
-        assert(std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c));
-        assert(fn_info.attrs.varargs == false);
-        assert(fn_info.param_types.len >= 2);
-        assert(fn_info.param_types[0] == c.id or fn_info.param_types[0] == objc.Object or fn_info.param_types[0] == c.Class or fn_info.param_types[0] == Class);
-        assert(fn_info.param_types[1] == c.SEL or fn_info.param_types[1] == objc.Sel);
+        comptime validateImpFn(Fn);
         const types = comptime objc.comptimeEncode(Fn);
         const imp_ptr: c.IMP = if (comptime @typeInfo(Imp) == .@"fn") @ptrCast(&imp) else @ptrCast(imp);
         return self.replaceMethodRaw(sel_or_name, imp_ptr, &types);
@@ -313,7 +324,7 @@ pub const Class = extern struct {
     /// directly implements `sel_or_name`.
     ///
     /// `imp` must be a `callconv(.c)` function or function pointer whose first two
-    /// parameters are `(c.id` / `c.Class` / `Class, c.SEL)`.
+    /// parameters are `(objc.Object` / `c.id` / `Class` / `c.Class` / `?*anyopaque` / `*anyopaque, objc.Sel` / `c.SEL)`.
     pub fn addMethod(self: Class, sel_or_name: anytype, imp: anytype) bool {
         const Imp = @TypeOf(imp);
         const Fn = switch (@typeInfo(Imp)) {
@@ -324,12 +335,7 @@ pub const Class = extern struct {
                 @compileError("Class.addMethod expected a function or function pointer, got " ++ @typeName(Imp)),
             else => @compileError("Class.addMethod expected a function or function pointer, got " ++ @typeName(Imp)),
         };
-        const fn_info = @typeInfo(Fn).@"fn";
-        assert(std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c));
-        assert(fn_info.attrs.varargs == false);
-        assert(fn_info.param_types.len >= 2);
-        assert(fn_info.param_types[0] == c.id or fn_info.param_types[0] == objc.Object or fn_info.param_types[0] == c.Class or fn_info.param_types[0] == Class);
-        assert(fn_info.param_types[1] == c.SEL or fn_info.param_types[1] == objc.Sel);
+        comptime validateImpFn(Fn);
         const types = comptime objc.comptimeEncode(Fn);
         const imp_ptr: c.IMP = if (comptime @typeInfo(Imp) == .@"fn") @ptrCast(&imp) else @ptrCast(imp);
         return self.addMethodRaw(sel_or_name, imp_ptr, &types);
@@ -356,6 +362,7 @@ pub const Class = extern struct {
     /// Must only be called between `allocateClassPair` and `registerClassPair` on a
     /// non-metaclass. Computes `@sizeOf(T)`, `log2(@alignOf(T))`, and `comptimeEncode(T)`.
     pub fn addIvar(self: Class, comptime T: type, name: [:0]const u8) bool {
+        comptime validateAddIvarType(T);
         const alignment_log2: u8 = @intCast(std.math.log2_int(usize, @alignOf(T)));
         const types = comptime objc.comptimeEncode(T);
         return self.addIvarRaw(name, @sizeOf(T), alignment_log2, &types);
@@ -387,7 +394,163 @@ pub const Class = extern struct {
     }
 };
 
-fn resolveSel(sel_or_name: anytype) objc.Sel {
+fn validateAddIvarNestedElement(comptime T: type, comptime seen: []const type) void {
+    switch (@typeInfo(T)) {
+        .optional => |opt| {
+            if (abi.WrapperUnderlying(opt.child) != null or abi.isBlockRefType(opt.child) or
+                @typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice)
+            {
+                @compileError("Class.addIvar cannot store 16-byte Zig optional struct " ++ @typeName(T) ++ " inside a pointer/array/aggregate; use objc.Object, objc.Class, *objc.Object, or ?*MyZigState instead");
+            }
+            if (@sizeOf(T) == 0) {
+                @compileError("Class.addIvar cannot store zero-sized optional pointer " ++ @typeName(T) ++ "; use ?*anyopaque");
+            }
+            const child = @typeInfo(opt.child).pointer.child;
+            for (seen) |prev| {
+                if (prev == child) return;
+            }
+            validateAddIvarNestedElement(child, seen ++ &[_]type{child});
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                @compileError("Class.addIvar does not support Zig slices (" ++ @typeName(T) ++ "); store a pointer and length or ?*MyZigState instead");
+            }
+            if (@sizeOf(T) == 0) {
+                @compileError("Class.addIvar cannot store zero-sized pointer " ++ @typeName(T) ++ "; use *anyopaque");
+            }
+            for (seen) |prev| {
+                if (prev == ptr.child) return;
+            }
+            validateAddIvarNestedElement(ptr.child, seen ++ &[_]type{ptr.child});
+        },
+        .array => |arr| {
+            if (@typeInfo(arr.child) == .@"struct" and @typeInfo(arr.child).@"struct".layout == .auto) {
+                @compileError("Class.addIvar requires extern/packed array elements, got auto-layout struct " ++ @typeName(arr.child));
+            }
+            if (@typeInfo(arr.child) == .@"union" and @typeInfo(arr.child).@"union".layout == .auto) {
+                @compileError("Class.addIvar requires extern/packed array elements, got auto-layout union " ++ @typeName(arr.child));
+            }
+            validateAddIvarNestedElement(arr.child, seen);
+        },
+        .@"struct" => |s| {
+            if (s.layout == .@"extern") {
+                for (seen) |prev| {
+                    if (prev == T) return;
+                }
+                const next_seen = seen ++ &[_]type{T};
+                for (s.field_types) |FieldType| {
+                    validateAddIvarNestedElement(FieldType, next_seen);
+                }
+            }
+        },
+        .@"union" => |u| {
+            if (u.layout == .@"extern") {
+                for (seen) |prev| {
+                    if (prev == T) return;
+                }
+                const next_seen = seen ++ &[_]type{T};
+                for (u.field_types) |FieldType| {
+                    validateAddIvarNestedElement(FieldType, next_seen);
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+fn validateAddIvarType(comptime T: type) void {
+    if (abi.WrapperUnderlying(T) != null or abi.isBlockRefType(T)) return;
+
+    switch (@typeInfo(T)) {
+        .optional => |opt| {
+            if (abi.WrapperUnderlying(opt.child) != null or abi.isBlockRefType(opt.child) or
+                @typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice)
+            {
+                @compileError("Class.addIvar cannot use 16-byte Zig optional struct " ++ @typeName(T) ++ " for an 8-byte Objective-C ivar; use objc.Object, objc.Class, objc.Sel, objc.c.id, or ?*MyZigState instead");
+            }
+            if (@sizeOf(T) == 0) {
+                @compileError("Class.addIvar cannot store zero-sized optional pointer " ++ @typeName(T) ++ "; use ?*anyopaque");
+            }
+            const child = @typeInfo(opt.child).pointer.child;
+            validateAddIvarNestedElement(child, &.{child});
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                @compileError("Class.addIvar does not support Zig slices (" ++ @typeName(T) ++ "); store a pointer and length or *MyZigState instead");
+            }
+            if (@sizeOf(T) == 0) {
+                @compileError("Class.addIvar cannot store zero-sized pointer " ++ @typeName(T) ++ "; use *anyopaque");
+            }
+            validateAddIvarNestedElement(ptr.child, &.{ptr.child});
+        },
+        .array => validateAddIvarNestedElement(T, &.{}),
+        .@"struct" => |s| {
+            if (s.layout == .auto) {
+                @compileError("Class.addIvar requires an extern/packed struct or pointer (*" ++ @typeName(T) ++ "), got auto-layout struct " ++ @typeName(T));
+            }
+            if (s.layout == .@"extern") {
+                for (s.field_types) |FieldType| {
+                    validateAddIvarNestedElement(FieldType, &.{T});
+                }
+            }
+        },
+        .@"union" => |u| {
+            if (u.layout == .auto) {
+                @compileError("Class.addIvar requires an extern/packed union or pointer (*" ++ @typeName(T) ++ "), got auto-layout union " ++ @typeName(T));
+            }
+            if (u.layout == .@"extern") {
+                for (u.field_types) |FieldType| {
+                    validateAddIvarNestedElement(FieldType, &.{T});
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+fn validateImpFn(comptime Fn: type) void {
+    if (@typeInfo(Fn) != .@"fn") {
+        @compileError("IMP must be a function type, got " ++ @typeName(Fn));
+    }
+    const fn_info = @typeInfo(Fn).@"fn";
+    if (!std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c)) {
+        @compileError("Objective-C IMP function must use callconv(.c): " ++ @typeName(Fn));
+    }
+    if (fn_info.attrs.varargs) {
+        @compileError("Class.addMethod/replaceMethod comptime encoding does not support varargs IMPs directly");
+    }
+    if (fn_info.param_types.len < 2) {
+        @compileError("Objective-C IMP function must accept at least (receiver, SEL) parameters");
+    }
+    const Receiver = fn_info.param_types[0] orelse
+        @compileError("Objective-C IMP receiver parameter (index 0) cannot be generic (`anytype`): " ++ @typeName(Fn));
+    const valid_receiver = (Receiver == c.id or
+        Receiver == objc.Object or
+        Receiver == c.Class or
+        Receiver == Class or
+        Receiver == ?*anyopaque or
+        Receiver == *anyopaque);
+    if (!valid_receiver) {
+        @compileError("Objective-C IMP first parameter (receiver) must be objc.Object, c.id, objc.Class, c.Class, ?*anyopaque, or *anyopaque, got " ++ @typeName(Receiver));
+    }
+    const Selector = fn_info.param_types[1] orelse
+        @compileError("Objective-C IMP selector parameter (index 1) cannot be generic (`anytype`): " ++ @typeName(Fn));
+    if (Selector != c.SEL and Selector != objc.Sel) {
+        @compileError("Objective-C IMP second parameter (_cmd) must be objc.Sel or c.SEL, got " ++ @typeName(Selector));
+    }
+    const Ret = fn_info.return_type orelse
+        @compileError("Objective-C IMP return type cannot be generic: " ++ @typeName(Fn));
+    if (Ret != void) {
+        abi.validateImpParamOrReturn(Ret);
+    }
+    for (fn_info.param_types[2..]) |maybe_param| {
+        const Param = maybe_param orelse
+            @compileError("Objective-C IMP parameter cannot be generic (`anytype`): " ++ @typeName(Fn));
+        abi.validateImpParamOrReturn(Param);
+    }
+}
+
+inline fn resolveSel(sel_or_name: anytype) objc.Sel {
     return switch (@TypeOf(sel_or_name)) {
         objc.Sel => sel_or_name,
         c.SEL => .{ .value = sel_or_name },
@@ -395,8 +558,42 @@ fn resolveSel(sel_or_name: anytype) objc.Sel {
     };
 }
 
+/// Looks up and caches the permanent/framework `Class` named `name` in a lock-free
+/// `.acquire`/`.release` atomic static slot per comptime class name (`objc_getClass`
+/// runs once on first call, caching both existing classes and `null` for missing classes).
+///
+/// NOTE: Intended only for permanent or framework classes whose lifetime spans the
+/// process (such as `"NSString"` or `"NSObject"`). Do **not** use `getClassCached` /
+/// `Class.cached` for dynamically created classes that may later be destroyed with
+/// `disposeClassPair`.
+pub inline fn getClassCached(comptime name: [:0]const u8) ?Class {
+    const Cache = struct {
+        var unresolved_sentinel: u8 = 0;
+        var slot: ?*anyopaque = @ptrCast(&unresolved_sentinel);
+
+        noinline fn resolve() ?Class {
+            @branchHint(.unlikely);
+            const resolved = c.objc_getClass(name.ptr);
+            @atomicStore(
+                ?*anyopaque,
+                &slot,
+                if (resolved) |cls_ptr| @ptrCast(cls_ptr) else null,
+                .release,
+            );
+            return .{ .value = resolved orelse return null };
+        }
+    };
+
+    const cached_ptr = @atomicLoad(?*anyopaque, &Cache.slot, .acquire);
+    if (cached_ptr != @as(?*anyopaque, @ptrCast(&Cache.unresolved_sentinel))) {
+        const raw: c.Class = if (cached_ptr) |p| @ptrCast(@alignCast(p)) else return null;
+        return .{ .value = raw };
+    }
+    return Cache.resolve();
+}
+
 /// Returns the registered `Class` named `name`, or `null` if not found (`objc_getClass`).
-pub fn getClass(name: [:0]const u8) ?Class {
+pub inline fn getClass(name: [:0]const u8) ?Class {
     return .{ .value = c.objc_getClass(name.ptr) orelse return null };
 }
 
@@ -886,7 +1083,7 @@ test "getName, getSuperclass, getVersion/setVersion, getImageName, ivar layouts,
     try testing.expect(img.len > 0);
 
     const cls = allocateClassPairExtra(NSObject, "ZigObjcMetaInfoClass", 0).?;
-    try testing.expect(cls.addIvar(?objc.Object, "strong_slot"));
+    try testing.expect(cls.addIvar(objc.Object, "strong_slot"));
     const layout_bytes: [:0]const u8 = "\x01";
     cls.setIvarLayout(layout_bytes.ptr);
     cls.setWeakIvarLayout(null);
@@ -1066,6 +1263,142 @@ test "getClassList, copyClassList, and enumerateClasses" {
         );
         try testing.expectEqual(@as(usize, 1), ZeroState.count);
     }
+}
+
+test "getClassCached and Class.cached lookup" {
+    const testing = std.testing;
+
+    const expected_str = getClass("NSString");
+    try testing.expect(expected_str != null);
+
+    // First call resolves and populates slot; second call hits the cached atomic slot.
+    const cached_str_1 = getClassCached("NSString");
+    const cached_str_2 = Class.cached("NSString");
+    try testing.expectEqual(expected_str.?.value, cached_str_1.?.value);
+    try testing.expectEqual(expected_str.?.value, cached_str_2.?.value);
+
+    // Distinct comptime strings of identical length (8 bytes) must use distinct cache slots.
+    const cached_num = getClassCached("NSNumber");
+    try testing.expect(cached_num != null);
+    try testing.expectEqual(getClass("NSNumber").?.value, cached_num.?.value);
+    try testing.expect(cached_num.?.value != getClassCached("NSString").?.value);
+    try testing.expect(Class.cached("NSNumber").?.value != Class.cached("NSString").?.value);
+
+    // Missing class resolves to null once and stays null on subsequent cached loads.
+    try testing.expect(getClassCached("DefinitelyMissingClassXYZ") == null);
+    try testing.expect(getClassCached("DefinitelyMissingClassXYZ") == null);
+    try testing.expect(Class.cached("DefinitelyMissingClassXYZ") == null);
+}
+
+test "addMethod and replaceMethod with direct objc.Object and objc.Sel IMPs" {
+    const testing = std.testing;
+
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSObject = Class.cached("NSObject") orelse return error.ClassNotFound;
+    const NSNumber = Class.cached("NSNumber") orelse return error.ClassNotFound;
+
+    const State = struct {
+        var compute_cmd_matched: bool = false;
+        var replace_cmd_matched: bool = false;
+    };
+    State.compute_cmd_matched = false;
+    State.replace_cmd_matched = false;
+
+    const DirectClass = allocateClassPair(NSObject, "ZigObjcDirectWrapperImpClass") orelse return error.AllocateClassFailed;
+    defer disposeClassPair(DirectClass);
+
+    try testing.expect(DirectClass.addIvar(i64, "base"));
+
+    const Impls = struct {
+        fn compute(self: objc.Object, _cmd: objc.Sel, other: objc.Object, delta: i64) callconv(.c) objc.Object {
+            State.compute_cmd_matched = _cmd.eql(objc.Sel.cached("computeWithOther:delta:"));
+            const base = self.getTypedIvar(i64, "base") orelse 0;
+            const other_val = other.msgSend(i64, "longLongValue", .{});
+            const total: c_longlong = base + other_val + delta;
+            return Class.cached("NSNumber").?.msgSend(objc.Object, "numberWithLongLong:", .{total});
+        }
+
+        fn tagInitial(self: objc.Object, _cmd: objc.Sel) callconv(.c) isize {
+            _ = self;
+            _ = _cmd;
+            return 11;
+        }
+
+        fn tagReplaced(self: objc.Object, _cmd: objc.Sel) callconv(.c) isize {
+            State.replace_cmd_matched = _cmd.eql(objc.Sel.cached("directTag"));
+            const base = self.getTypedIvar(i64, "base") orelse 0;
+            return @intCast(base + 7);
+        }
+    };
+
+    try testing.expect(DirectClass.addMethod("computeWithOther:delta:", Impls.compute));
+    try testing.expect(DirectClass.replaceMethod("directTag", Impls.tagInitial) == null);
+    const prev_imp = DirectClass.replaceMethod("directTag", &Impls.tagReplaced);
+    try testing.expectEqual(@as(c.IMP, @ptrCast(&Impls.tagInitial)), prev_imp);
+
+    registerClassPair(DirectClass);
+
+    const inst = DirectClass.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "init", .{});
+    defer inst.release();
+    try testing.expect(inst.setTypedIvar(i64, "base", 100));
+
+    const other_num = NSNumber.msgSend(objc.Object, "numberWithInt:", .{@as(c_int, 23)});
+    const result_obj = inst.msgSend(objc.Object, "computeWithOther:delta:", .{ other_num, @as(i64, -5) });
+    try testing.expect(State.compute_cmd_matched);
+    try testing.expectEqual(@as(i64, 118), result_obj.msgSend(i64, "longLongValue", .{}));
+
+    const tag_val = inst.msgSend(isize, "directTag", .{});
+    try testing.expect(State.replace_cmd_matched);
+    try testing.expectEqual(@as(isize, 107), tag_val);
+}
+
+test "Class.addIvar and IvarSlot with self-referential ?*Node and opaque *ZigStruct" {
+    const testing = std.testing;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const Node = extern struct {
+        next: ?*@This(),
+        val: i32,
+        _pad: i32 = 0,
+    };
+    const ZigAppState = struct {
+        title: []const u8,
+        weak: objc.Weak,
+    };
+
+    const NSObject = Class.cached("NSObject") orelse return error.ClassNotFound;
+    const cls = allocateClassPair(NSObject, "ZigObjcSelfRefIvarClass") orelse return error.AllocateClassFailed;
+    defer disposeClassPair(cls);
+
+    try testing.expect(cls.addIvar(Node, "inline_node"));
+    try testing.expect(cls.addIvar(?*Node, "head_ptr"));
+    try testing.expect(cls.addIvar(?*ZigAppState, "app_state"));
+    registerClassPair(cls);
+
+    const inst = objc.allocInit(cls) orelse return error.AllocInitFailed;
+    defer inst.release();
+
+    const node_slot = objc.IvarSlot(Node).fromClass(cls, "inline_node") orelse return error.SlotMissing;
+    const head_slot = objc.IvarSlot(?*Node).fromClass(cls, "head_ptr") orelse return error.SlotMissing;
+    const state_slot = objc.IvarSlot(?*ZigAppState).fromClass(cls, "app_state") orelse return error.SlotMissing;
+
+    var tail: Node = .{ .next = null, .val = 99 };
+    node_slot.store(inst, .{ .next = &tail, .val = 11 });
+    head_slot.store(inst, &tail);
+
+    var app_state: ZigAppState = .{ .title = "hardened", .weak = .{} };
+    app_state.weak.init(null);
+    defer app_state.weak.deinit();
+    state_slot.store(inst, &app_state);
+
+    const loaded_node = node_slot.load(inst);
+    try testing.expectEqual(@as(i32, 11), loaded_node.val);
+    try testing.expectEqual(@as(i32, 99), loaded_node.next.?.val);
+    try testing.expectEqual(&tail, head_slot.load(inst).?);
+    try testing.expectEqualStrings("hardened", state_slot.load(inst).?.title);
 }
 
 test {

@@ -13,13 +13,13 @@ extern "c" fn objc_moveWeak(dst: *c.id, src: *c.id) void;
 /// `location` must not already hold a registered non-null weak reference;
 /// use `storeWeak` to reassign an already-initialized weak slot, and
 /// `destroyWeak` before `location`'s storage ends its lifetime.
-pub fn initWeak(location: *c.id, obj: ?objc.Object) ?objc.Object {
+pub inline fn initWeak(location: *c.id, obj: ?objc.Object) ?objc.Object {
     const raw = objc_initWeak(location, if (obj) |o| o.value else null);
     return if (raw == null) null else objc.Object.fromId(raw);
 }
 
 /// Unregisters `location` from the Objective-C weak reference side table and clears `*location`.
-pub fn destroyWeak(location: *c.id) void {
+pub inline fn destroyWeak(location: *c.id) void {
     objc_destroyWeak(location);
     location.* = null;
 }
@@ -27,33 +27,33 @@ pub fn destroyWeak(location: *c.id) void {
 /// Loads the weakly referenced object at `location` as a `+1` retained `Object`,
 /// or returns `null` if the slot is `nil` or the referent is deallocating/deallocated.
 /// The caller owns the returned reference and must call `release()`.
-pub fn loadWeakRetained(location: *c.id) ?objc.Object {
+pub inline fn loadWeakRetained(location: *c.id) ?objc.Object {
     const raw = objc_loadWeakRetained(location);
     return if (raw == null) null else objc.Object.fromId(raw);
 }
 
 /// Loads and autoreleases the weakly referenced object at `location` (`objc_loadWeak`),
 /// or returns `null` if the slot is `nil` or the referent is deallocating/deallocated.
-pub fn loadWeak(location: *c.id) ?objc.Object {
+pub inline fn loadWeak(location: *c.id) ?objc.Object {
     const raw = c.objc_loadWeak(location);
     return if (raw == null) null else objc.Object.fromId(raw);
 }
 
 /// Updates an initialized weak pointer slot at `location` to reference `obj` (`objc_storeWeak`),
 /// returning the stored object (or `null` if `obj` is `null` or deallocating).
-pub fn storeWeak(location: *c.id, obj: ?objc.Object) ?objc.Object {
+pub inline fn storeWeak(location: *c.id, obj: ?objc.Object) ?objc.Object {
     const raw = c.objc_storeWeak(location, if (obj) |o| o.value else null);
     return if (raw == null) null else objc.Object.fromId(raw);
 }
 
 /// Copies a weak reference from `src` into an uninitialized weak slot `dst` (`objc_copyWeak`).
-pub fn copyWeak(dst: *c.id, src: *c.id) void {
+pub inline fn copyWeak(dst: *c.id, src: *c.id) void {
     objc_copyWeak(dst, src);
 }
 
 /// Moves a weak reference from `src` into an uninitialized weak slot `dst` (`objc_moveWeak`),
 /// unregistering `src` and leaving `src.*` set to `null`.
-pub fn moveWeak(dst: *c.id, src: *c.id) void {
+pub inline fn moveWeak(dst: *c.id, src: *c.id) void {
     objc_moveWeak(dst, src);
 }
 
@@ -77,6 +77,10 @@ pub fn WeakType(comptime T: type) type {
     return struct {
         slot: c.id = null,
 
+        /// Comptime marker identifying `WeakType(T)` so `Block` capture validation can
+        /// reject accidental bitwise capture (`memcpy`) of weak side-table slots.
+        pub const zig_objc_is_weak = true;
+
         const Self = @This();
 
         inline fn unwrap(obj: ?T) c.id {
@@ -94,13 +98,20 @@ pub fn WeakType(comptime T: type) type {
 
         /// Initializes an unregistered weak slot (`var w: Weak = .{}; w.init(obj);`) via `objc_initWeak`.
         /// To reassign a `Weak` that may already hold a reference, use `store`.
-        pub fn init(self: *Self, obj: ?T) void {
+        pub inline fn init(self: *Self, obj: ?T) void {
             _ = objc_initWeak(&self.slot, unwrap(obj));
+        }
+
+        /// Initializes an unregistered weak slot in-place via `objc_initWeak` and returns
+        /// the stored object (or `null` if `obj` is `null` or already deallocating).
+        pub inline fn initValue(self: *Self, obj: ?T) ?T {
+            const raw = objc_initWeak(&self.slot, unwrap(obj));
+            return if (raw == null) null else wrap(raw);
         }
 
         /// Unregisters `&self.slot` from the Objective-C weak side table (`objc_destroyWeak`)
         /// and resets `self.slot` to `null`. Safe to call multiple times.
-        pub fn deinit(self: *Self) void {
+        pub inline fn deinit(self: *Self) void {
             objc_destroyWeak(&self.slot);
             self.slot = null;
         }
@@ -108,28 +119,31 @@ pub fn WeakType(comptime T: type) type {
         /// Atomically loads and retains (`+1`) the referent (`objc_loadWeakRetained`),
         /// returning `null` if `nil` or already deallocating/deallocated.
         /// Caller must release the returned object when non-null.
-        pub fn loadRetained(self: *Self) ?T {
+        pub inline fn loadRetained(self: *Self) ?T {
             const raw = objc_loadWeakRetained(&self.slot);
             return if (raw == null) null else wrap(raw);
         }
 
+        /// Alias for `loadRetained` (`+1` retained load).
+        pub const load = loadRetained;
+
         /// Atomically loads and autoreleases the referent (`objc_loadWeak`),
         /// returning `null` if `nil` or already deallocating/deallocated.
-        pub fn loadAutoreleased(self: *Self) ?T {
+        pub inline fn loadAutoreleased(self: *Self) ?T {
             const raw = c.objc_loadWeak(&self.slot);
             return if (raw == null) null else wrap(raw);
         }
 
         /// Stores `obj` (or `null` to clear) into `&self.slot` (`objc_storeWeak`),
         /// properly updating side-table registrations if `self` already held a reference.
-        pub fn store(self: *Self, obj: ?T) ?T {
+        pub inline fn store(self: *Self, obj: ?T) ?T {
             const raw = c.objc_storeWeak(&self.slot, unwrap(obj));
             return if (raw == null) null else wrap(raw);
         }
 
         /// Copies the weak reference from `src` into `dst` (`objc_copyWeak`).
         /// If `dst` already holds an active weak reference, it is unregistered first.
-        pub fn copyFrom(dst: *Self, src: *Self) void {
+        pub inline fn copyFrom(dst: *Self, src: *Self) void {
             if (dst == src) return;
             if (dst.slot != null) objc_destroyWeak(&dst.slot);
             objc_copyWeak(&dst.slot, &src.slot);
@@ -138,7 +152,7 @@ pub fn WeakType(comptime T: type) type {
         /// Moves the weak reference from `src` into `dst` (`objc_moveWeak`),
         /// leaving `src` cleared (`null`). If `dst` already holds an active weak reference,
         /// it is unregistered first.
-        pub fn moveFrom(dst: *Self, src: *Self) void {
+        pub inline fn moveFrom(dst: *Self, src: *Self) void {
             if (dst == src) return;
             if (dst.slot != null) objc_destroyWeak(&dst.slot);
             objc_moveWeak(&dst.slot, &src.slot);
@@ -318,4 +332,50 @@ test "standalone weak functions and WeakType custom wrapper" {
     obj.release();
     try testing.expect(loadWeakRetained(&slot3) == null);
     try testing.expect(custom_weak.loadRetained() == null);
+}
+
+test "Weak with tagged-pointer NSNumber loads cleanly and deinits safely" {
+    const testing = std.testing;
+
+    try testing.expect(Weak.zig_objc_is_weak);
+
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSNumber = objc.getClass("NSNumber") orelse return error.ClassNotFound;
+    const tagged_num = NSNumber.msgSend(objc.Object, "numberWithInt:", .{@as(c_int, 7)});
+
+    var weak_num: Weak = .{};
+    defer weak_num.deinit();
+
+    const initialized = weak_num.initValue(tagged_num) orelse return error.ExpectedTaggedObject;
+    try testing.expectEqual(@as(c_int, 7), initialized.msgSend(c_int, "intValue", .{}));
+
+    {
+        const loaded = weak_num.load() orelse return error.ExpectedTaggedObject;
+        defer loaded.release();
+        try testing.expectEqual(@as(c_int, 7), loaded.msgSend(c_int, "intValue", .{}));
+    }
+
+    {
+        const auto_loaded = weak_num.loadAutoreleased() orelse return error.ExpectedTaggedObject;
+        try testing.expectEqual(@as(c_int, 7), auto_loaded.msgSend(c_int, "intValue", .{}));
+    }
+
+    var copied_num: Weak = .{};
+    defer copied_num.deinit();
+    copied_num.copyFrom(&weak_num);
+    {
+        const loaded_copy = copied_num.loadRetained() orelse return error.ExpectedTaggedObject;
+        defer loaded_copy.release();
+        try testing.expectEqual(@as(c_int, 7), loaded_copy.msgSend(c_int, "intValue", .{}));
+    }
+
+    weak_num.deinit();
+    try testing.expect(weak_num.load() == null);
+}
+
+test {
+    std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(Weak);
 }
