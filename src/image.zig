@@ -23,24 +23,32 @@ pub fn copyImageNames() [][*:0]const u8 {
     return ptr[0..count];
 }
 
+const CopyImageHeadersFn = *const fn (*c_uint) callconv(.c) ?[*]const *const MachHeader;
+const SetHookGetImageNameFn = *const fn (HookGetImageName, *HookGetImageName) callconv(.c) void;
+const SetHookGetClassFn = *const fn (HookGetClass, *HookGetClass) callconv(.c) void;
+const SetHookLazyClassNamerFn = *const fn (HookLazyClassNamer, *HookLazyClassNamer) callconv(.c) void;
+const AddLoadImageFuncFn = *const fn (LoadImageFunc) callconv(.c) void;
+
+/// Reports whether `objc_copyImageHeaders` is available in the running Objective-C runtime.
+pub fn hasCopyImageHeaders() bool {
+    return cpkg.weakExtern(?CopyImageHeadersFn, "objc_copyImageHeaders") != null;
+}
+
 /// Returns the Mach-O headers of all loaded images containing Objective-C or
 /// Swift code (`objc_copyImageHeaders`).
 ///
 /// The caller must free the returned slice with `objc.free`.
-/// On older Apple SDKs that do not declare `objc_copyImageHeaders`, returns `&.{}`.
+/// Weak-linked so binaries targeting older Apple OS versions launch cleanly;
+/// returns `&.{}` when unavailable in the SDK or on the running OS version.
 pub fn copyImageHeaders() []const *const MachHeader {
-    if (@hasDecl(c, "objc_copyImageHeaders")) {
-        var count: c_uint = 0;
-        const raw = c.objc_copyImageHeaders(&count);
-        if (raw == null) return &.{};
-        if (count == 0) {
-            std.c.free(@ptrCast(@constCast(raw)));
-            return &.{};
-        }
-        const ptr: [*]const *const MachHeader = @ptrCast(raw);
-        return ptr[0..count];
+    const func = cpkg.weakExtern(?CopyImageHeadersFn, "objc_copyImageHeaders") orelse return &.{};
+    var count: c_uint = 0;
+    const raw = func(&count) orelse return &.{};
+    if (count == 0) {
+        std.c.free(@ptrCast(@constCast(raw)));
+        return &.{};
     }
-    return &.{};
+    return raw[0..count];
 }
 
 /// Returns the path of the dynamic library or framework `cls` originated from
@@ -88,13 +96,21 @@ pub const HookGetImageName = if (@hasDecl(c, "objc_hook_getImageName"))
 else
     ?*const fn (c.Class, [*c][*c]const u8) callconv(.c) c.BOOL;
 
+/// Reports whether `objc_setHook_getImageName` is available in the running Objective-C runtime.
+pub fn hasSetHookGetImageName() bool {
+    return cpkg.weakExtern(?SetHookGetImageNameFn, "objc_setHook_getImageName") != null;
+}
+
 /// Installs a hook for `class_getImageName` (`objc_setHook_getImageName`), storing
 /// the previous hook in `out_old_value`. Unrecognized classes must be delegated to
-/// `out_old_value.*`.
+/// `out_old_value.*`. Weak-linked for older deployment targets; sets `out_old_value.* = null`
+/// and no-ops if unavailable at runtime.
 pub fn setHookGetImageName(new_value: HookGetImageName, out_old_value: *HookGetImageName) void {
     assert(new_value != null);
-    if (@hasDecl(c, "objc_setHook_getImageName")) {
-        c.objc_setHook_getImageName(new_value, out_old_value);
+    if (cpkg.weakExtern(?SetHookGetImageNameFn, "objc_setHook_getImageName")) |func| {
+        func(new_value, out_old_value);
+    } else {
+        out_old_value.* = null;
     }
 }
 
@@ -104,13 +120,21 @@ pub const HookGetClass = if (@hasDecl(c, "objc_hook_getClass"))
 else
     ?*const fn ([*c]const u8, [*c]c.Class) callconv(.c) c.BOOL;
 
+/// Reports whether `objc_setHook_getClass` is available in the running Objective-C runtime.
+pub fn hasSetHookGetClass() bool {
+    return cpkg.weakExtern(?SetHookGetClassFn, "objc_setHook_getClass") != null;
+}
+
 /// Installs a hook for `objc_getClass` (`objc_setHook_getClass`), storing the
 /// previous hook in `out_old_value`. Unrecognized class names must be delegated
-/// to `out_old_value.*`.
+/// to `out_old_value.*`. Weak-linked for older deployment targets; sets `out_old_value.* = null`
+/// and no-ops if unavailable at runtime.
 pub fn setHookGetClass(new_value: HookGetClass, out_old_value: *HookGetClass) void {
     assert(new_value != null);
-    if (@hasDecl(c, "objc_setHook_getClass")) {
-        c.objc_setHook_getClass(new_value, out_old_value);
+    if (cpkg.weakExtern(?SetHookGetClassFn, "objc_setHook_getClass")) |func| {
+        func(new_value, out_old_value);
+    } else {
+        out_old_value.* = null;
     }
 }
 
@@ -120,13 +144,21 @@ pub const HookLazyClassNamer = if (@hasDecl(c, "objc_hook_lazyClassNamer"))
 else
     ?*const fn (c.Class) callconv(.c) [*c]const u8;
 
+/// Reports whether `objc_setHook_lazyClassNamer` is available in the running Objective-C runtime.
+pub fn hasSetHookLazyClassNamer() bool {
+    return cpkg.weakExtern(?SetHookLazyClassNamerFn, "objc_setHook_lazyClassNamer") != null;
+}
+
 /// Installs a hook for lazily-named classes (`objc_setHook_lazyClassNamer`),
 /// storing the previous hook in `out_old_value`. Unrecognized classes must be
-/// delegated to `out_old_value.*`.
+/// delegated to `out_old_value.*`. Weak-linked for older deployment targets; sets
+/// `out_old_value.* = null` and no-ops if unavailable at runtime.
 pub fn setHookLazyClassNamer(new_value: HookLazyClassNamer, out_old_value: *HookLazyClassNamer) void {
     assert(new_value != null);
-    if (@hasDecl(c, "objc_setHook_lazyClassNamer")) {
-        c.objc_setHook_lazyClassNamer(new_value, out_old_value);
+    if (cpkg.weakExtern(?SetHookLazyClassNamerFn, "objc_setHook_lazyClassNamer")) |func| {
+        func(new_value, out_old_value);
+    } else {
+        out_old_value.* = null;
     }
 }
 
@@ -137,12 +169,18 @@ pub const LoadImageFunc = if (@hasDecl(c, "objc_func_loadImage"))
 else
     ?*const fn (?*const MachHeader) callconv(.c) void;
 
+/// Reports whether `objc_addLoadImageFunc` is available in the running Objective-C runtime.
+pub fn hasAddLoadImageFunc() bool {
+    return cpkg.weakExtern(?AddLoadImageFuncFn, "objc_addLoadImageFunc") != null;
+}
+
 /// Registers `func` to be invoked immediately for all currently loaded Objective-C
 /// images and subsequently before `+load` for newly loaded images (`objc_addLoadImageFunc`).
+/// Weak-linked for older deployment targets; no-ops if unavailable at runtime.
 pub fn addLoadImageFunc(func: LoadImageFunc) void {
     assert(func != null);
-    if (@hasDecl(c, "objc_addLoadImageFunc")) {
-        c.objc_addLoadImageFunc(func);
+    if (cpkg.weakExtern(?AddLoadImageFuncFn, "objc_addLoadImageFunc")) |func_ptr| {
+        func_ptr(func);
     }
 }
 
@@ -197,7 +235,7 @@ test "copyImageHeaders" {
     const headers = copyImageHeaders();
     defer objc.free(headers);
 
-    if (@hasDecl(c, "objc_copyImageHeaders")) {
+    if (hasCopyImageHeaders()) {
         try testing.expect(headers.len > 0);
         // Every header must coerce cleanly to *const anyopaque (used by objc_enumerateClasses)
         // and point to a valid Mach-O header in memory.
@@ -242,7 +280,7 @@ test "setEnumerationMutationHandler and enumerationMutation" {
 }
 
 test "setHookGetClass intercepts unknown classes and preserves normal lookup" {
-    if (!@hasDecl(c, "objc_setHook_getClass")) return;
+    if (!hasSetHookGetClass()) return;
     const testing = std.testing;
 
     const NSObject = objc.getClass("NSObject") orelse return error.ClassNotFound;
@@ -308,7 +346,7 @@ test "setHookGetClass intercepts unknown classes and preserves normal lookup" {
 }
 
 test "setHookGetImageName intercepts target class and delegates others" {
-    if (!@hasDecl(c, "objc_setHook_getImageName")) return;
+    if (!hasSetHookGetImageName()) return;
     const testing = std.testing;
 
     const NSObject = objc.getClass("NSObject").?;
@@ -350,7 +388,7 @@ test "setHookGetImageName intercepts target class and delegates others" {
 }
 
 test "setHookLazyClassNamer installs and restores hook" {
-    if (!@hasDecl(c, "objc_setHook_lazyClassNamer")) return;
+    if (!hasSetHookLazyClassNamer()) return;
     const testing = std.testing;
 
     const State = struct {
@@ -375,7 +413,7 @@ test "setHookLazyClassNamer installs and restores hook" {
 }
 
 test "addLoadImageFunc invokes callback for currently loaded images" {
-    if (!@hasDecl(c, "objc_addLoadImageFunc")) return;
+    if (!hasAddLoadImageFunc()) return;
     const testing = std.testing;
 
     const State = struct {

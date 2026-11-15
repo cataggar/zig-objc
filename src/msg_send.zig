@@ -127,39 +127,43 @@ pub fn MsgSend(comptime T: type) type {
                 // AArch64 uses objc_msgSend / objc_msgSendSuper for all types.
                 .aarch64 => if (super) &c.objc_msgSendSuper else &c.objc_msgSend,
 
-                // x86_64 SysV ABI routing:
-                // - structs/unions > 16 bytes return on the stack via *_stret
-                // - 80-bit `long double` returns in x87 st(0) via objc_msgSend_fpret
+                // x86_64 SysV AMD64 ABI routing:
+                // - MEMORY-class aggregates (> 16 bytes, unaligned fields, or mixed x87)
+                //   return on the stack via objc_msgSend_stret / objc_msgSendSuper_stret
+                // - [X87, X87UP] 80-bit `long double` (and single-leaf `long double`
+                //   aggregates at offset 0) return in x87 %st(0) via objc_msgSend_fpret
                 //   (super calls still use objc_msgSendSuper; no Super_fpret exists)
-                // - `float` (f32) and `double` (f64 / CGFloat) return in xmm0 via objc_msgSend
-                .x86_64 => switch (@typeInfo(Return)) {
-                    inline .int,
-                    .bool,
-                    .@"enum",
-                    .pointer,
-                    .void,
-                    .vector,
-                    => if (super) &c.objc_msgSendSuper else &c.objc_msgSend,
+                // - `float` (f32), `double` (f64 / CGFloat), register-class structs/unions,
+                //   and packed structs <= 128 bits return via objc_msgSend / objc_msgSendSuper
+                .x86_64 => blk: {
+                    if (cpkg.usesStret(Return)) {
+                        break :blk if (super) &c.objc_msgSendSuper_stret else &c.objc_msgSend_stret;
+                    }
+                    if (cpkg.usesFpret(Return)) {
+                        break :blk if (super) &c.objc_msgSendSuper else &c.objc_msgSend_fpret;
+                    }
+                    switch (@typeInfo(Return)) {
+                        .int,
+                        .bool,
+                        .@"enum",
+                        .pointer,
+                        .void,
+                        .vector,
+                        .float,
+                        .@"struct",
+                        .@"union",
+                        => break :blk if (super) &c.objc_msgSendSuper else &c.objc_msgSend,
 
-                    .optional => |opt| opt: {
-                        assert(@typeInfo(opt.child) == .pointer);
-                        break :opt if (super) &c.objc_msgSendSuper else &c.objc_msgSend;
-                    },
+                        .optional => |opt| {
+                            assert(@typeInfo(opt.child) == .pointer);
+                            break :blk if (super) &c.objc_msgSendSuper else &c.objc_msgSend;
+                        },
 
-                    .@"struct", .@"union" => if (@sizeOf(Return) > 16)
-                        (if (super) &c.objc_msgSendSuper_stret else &c.objc_msgSend_stret)
-                    else
-                        (if (super) &c.objc_msgSendSuper else &c.objc_msgSend),
-
-                    .float => |float| if (Return == c_longdouble or float.bits == 80)
-                        (if (super) &c.objc_msgSendSuper else &c.objc_msgSend_fpret)
-                    else
-                        (if (super) &c.objc_msgSendSuper else &c.objc_msgSend),
-
-                    else => {
-                        @compileLog(@typeInfo(Return));
-                        @compileError("unsupported return type for objc runtime on x86_64");
-                    },
+                        else => {
+                            @compileLog(@typeInfo(Return));
+                            @compileError("unsupported return type for objc runtime on x86_64");
+                        },
+                    }
                 },
 
                 else => @compileError("unsupported objc architecture"),
@@ -242,6 +246,8 @@ fn unwrapType(comptime T: type) type {
         .@"struct" => |s| {
             if (s.layout != .@"extern" and s.layout != .@"packed")
                 @compileError("msgSend: " ++ @typeName(T) ++ " — struct must be extern or packed");
+            if (s.layout == .@"packed" and @bitSizeOf(T) > 128)
+                @compileError("msgSend: " ++ @typeName(T) ++ " — packed struct larger than 128 bits is not C-ABI compatible");
         },
         .@"union" => |u| {
             if (u.layout != .@"extern")
@@ -316,16 +322,28 @@ test "MsgSendFn signatures" {
         const Sender = MsgSend(objc.Object);
         const Small = extern struct { a: u64, b: u64 };
         const Large = extern struct { a: u64, b: u64, d: u64 };
+        const Unaligned9 = extern struct { a: u8, b: i64 align(1) };
+        const TailPacked9 = extern struct { a: i64 align(1), b: u8 };
+        const LongDoubleWrap = extern struct { x: c_longdouble };
+        const Packed64 = packed struct(u64) { lo: u32, hi: u32 };
         try testing.expectEqual(&c.objc_msgSend, Sender.msgSendPtr(f32, false));
         try testing.expectEqual(&c.objc_msgSendSuper, Sender.msgSendPtr(f32, true));
         try testing.expectEqual(&c.objc_msgSend, Sender.msgSendPtr(f64, false));
         try testing.expectEqual(&c.objc_msgSendSuper, Sender.msgSendPtr(f64, true));
         try testing.expectEqual(&c.objc_msgSend_fpret, Sender.msgSendPtr(c_longdouble, false));
         try testing.expectEqual(&c.objc_msgSendSuper, Sender.msgSendPtr(c_longdouble, true));
+        try testing.expectEqual(&c.objc_msgSend_fpret, Sender.msgSendPtr(LongDoubleWrap, false));
+        try testing.expectEqual(&c.objc_msgSendSuper, Sender.msgSendPtr(LongDoubleWrap, true));
         try testing.expectEqual(&c.objc_msgSend, Sender.msgSendPtr(Small, false));
         try testing.expectEqual(&c.objc_msgSendSuper, Sender.msgSendPtr(Small, true));
         try testing.expectEqual(&c.objc_msgSend_stret, Sender.msgSendPtr(Large, false));
         try testing.expectEqual(&c.objc_msgSendSuper_stret, Sender.msgSendPtr(Large, true));
+        try testing.expectEqual(&c.objc_msgSend_stret, Sender.msgSendPtr(Unaligned9, false));
+        try testing.expectEqual(&c.objc_msgSendSuper_stret, Sender.msgSendPtr(Unaligned9, true));
+        try testing.expectEqual(&c.objc_msgSend, Sender.msgSendPtr(TailPacked9, false));
+        try testing.expectEqual(&c.objc_msgSendSuper, Sender.msgSendPtr(TailPacked9, true));
+        try testing.expectEqual(&c.objc_msgSend, Sender.msgSendPtr(Packed64, false));
+        try testing.expectEqual(&c.objc_msgSendSuper, Sender.msgSendPtr(Packed64, true));
         try testing.expect(msgForwardStret != null);
     } else if (builtin.target.cpu.arch == .aarch64) {
         try testing.expect(msgForwardStret == null);
@@ -600,4 +618,69 @@ test "WrapperUnderlying Ivar/Method and msgSendTry/msgSendSuperTry delegates" {
         .ok => |cls| try testing.expectEqual(NSObject.value, cls.value),
         .exception => return error.UnexpectedException,
     }
+}
+
+test "msgSend and msgSendSuper with unaligned, tail-packed, packed, and long-double structs" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const Unaligned9 = extern struct { a: u8, b: i64 align(1) };
+    const TailPacked9 = extern struct { a: i64 align(1), b: u8 };
+    const Packed64 = packed struct(u64) { lo: u32, hi: u32 };
+    const LongDoubleWrap = extern struct { x: c_longdouble };
+
+    const NSObject = objc.getClass("NSObject").?;
+    const Base = objc.allocateClassPair(NSObject, "ZigObjcUnalignedAbiBase").?;
+    defer objc.disposeClassPair(Base);
+
+    const base_impls = struct {
+        fn getUnaligned(_: c.id, _: c.SEL) callconv(.c) Unaligned9 {
+            return .{ .a = 0x5A, .b = -0x1234_5678_9ABC_DEF0 };
+        }
+        fn getTailPacked(_: c.id, _: c.SEL) callconv(.c) TailPacked9 {
+            return .{ .a = 0x0FED_CBA9_8765_4321, .b = 0x7F };
+        }
+        fn getPacked(_: c.id, _: c.SEL) callconv(.c) Packed64 {
+            return .{ .lo = 100, .hi = 200 };
+        }
+        fn getLongDoubleWrap(_: c.id, _: c.SEL) callconv(.c) LongDoubleWrap {
+            return .{ .x = 6.25 };
+        }
+    };
+    try testing.expect(Base.addMethod("getUnaligned", base_impls.getUnaligned));
+    try testing.expect(Base.addMethod("getTailPacked", base_impls.getTailPacked));
+    try testing.expect(Base.addMethod("getPacked", base_impls.getPacked));
+    try testing.expect(Base.addMethod("getLongDoubleWrap", base_impls.getLongDoubleWrap));
+    objc.registerClassPair(Base);
+
+    const Sub = objc.allocateClassPair(Base, "ZigObjcUnalignedAbiSub").?;
+    defer objc.disposeClassPair(Sub);
+
+    const sub_impls = struct {
+        fn getUnaligned(target: c.id, _: c.SEL) callconv(.c) Unaligned9 {
+            const self = objc.Object.fromId(target);
+            const sup = self.msgSendSuper(objc.getClass("ZigObjcUnalignedAbiBase").?, Unaligned9, "getUnaligned", .{});
+            return .{ .a = sup.a + 1, .b = sup.b + 10 };
+        }
+    };
+    try testing.expect(Sub.addMethod("getUnaligned", sub_impls.getUnaligned));
+    objc.registerClassPair(Sub);
+
+    const inst = objc.allocInit(Sub).?;
+    defer inst.release();
+
+    const unaligned = inst.msgSend(Unaligned9, "getUnaligned", .{});
+    try testing.expectEqual(@as(u8, 0x5B), unaligned.a);
+    try testing.expectEqual(@as(i64, -0x1234_5678_9ABC_DEE6), unaligned.b);
+
+    const tail_packed = inst.msgSend(TailPacked9, "getTailPacked", .{});
+    try testing.expectEqual(@as(i64, 0x0FED_CBA9_8765_4321), tail_packed.a);
+    try testing.expectEqual(@as(u8, 0x7F), tail_packed.b);
+
+    const packed_val = inst.msgSend(Packed64, "getPacked", .{});
+    try testing.expectEqual(Packed64{ .lo = 100, .hi = 200 }, packed_val);
+
+    const ld_wrap = inst.msgSend(LongDoubleWrap, "getLongDoubleWrap", .{});
+    try testing.expectApproxEqAbs(@as(f64, 6.25), @as(f64, @floatCast(ld_wrap.x)), 1e-12);
 }

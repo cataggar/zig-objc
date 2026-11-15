@@ -255,7 +255,7 @@ pub fn Block(
             ctx.isa = NSConcreteStackBlock;
             ctx.flags = .{
                 .copy_dispose = has_managed_captures,
-                .stret = usesStret(CReturn),
+                .stret = cpkg.usesStret(CReturn),
                 .signature = true,
             };
             ctx.reserved = 0;
@@ -281,7 +281,7 @@ pub fn Block(
                     .flags = .{
                         .copy_dispose = false,
                         .global = true,
-                        .stret = usesStret(CReturn),
+                        .stret = cpkg.usesStret(CReturn),
                         .signature = true,
                     },
                     .reserved = 0,
@@ -543,18 +543,6 @@ fn extractParamTypes(comptime Args: anytype) [Args.len]type {
     return result;
 }
 
-fn usesStret(comptime Return: type) bool {
-    return switch (builtin.target.cpu.arch) {
-        .aarch64 => false,
-        .x86_64 => switch (@typeInfo(Return)) {
-            .@"struct" => |s| s.layout != .@"packed" and @sizeOf(Return) > 16,
-            .@"union" => @sizeOf(Return) > 16,
-            else => false,
-        },
-        else => false,
-    };
-}
-
 fn WrapperUnderlying(comptime T: type) ?type {
     return switch (T) {
         objc.Object => c.id,
@@ -584,6 +572,15 @@ fn cAbiBlockFnType(comptime T: type) type {
         const Child = @typeInfo(T).optional.child;
         if (WrapperUnderlying(Child)) |V| return NullablePtr(V);
         if (isBlockRefType(Child)) return ?*anyopaque;
+    }
+    if (@typeInfo(T) == .@"struct") {
+        const s = @typeInfo(T).@"struct";
+        if (s.layout != .@"extern" and s.layout != .@"packed") {
+            @compileError("Block: " ++ @typeName(T) ++ " — struct must be extern or packed");
+        }
+        if (s.layout == .@"packed" and @bitSizeOf(T) > 128) {
+            @compileError("Block: " ++ @typeName(T) ++ " — packed struct larger than 128 bits is not C-ABI compatible");
+        }
     }
     return T;
 }
@@ -649,6 +646,8 @@ fn unwrapBlockType(comptime T: type) type {
         .@"struct" => |s| {
             if (s.layout != .@"extern" and s.layout != .@"packed")
                 @compileError("BlockRef: " ++ @typeName(T) ++ " — struct must be extern or packed");
+            if (s.layout == .@"packed" and @bitSizeOf(T) > 128)
+                @compileError("BlockRef: " ++ @typeName(T) ++ " — packed struct larger than 128 bits is not C-ABI compatible");
         },
         .@"union" => |u| {
             if (u.layout != .@"extern")
@@ -1371,6 +1370,55 @@ test "low-level Block.h helpers and BlockFieldFlags" {
 
     objectDispose(slot, .BLOCK_FIELD_IS_OBJECT);
     try std.testing.expectEqual(@as(c_ulong, 1), obj.msgSend(c_ulong, "retainCount", .{}));
+}
+
+test "Block, BlockRef, and impImplementationWithBlock returning unaligned struct" {
+    const testing = std.testing;
+    const Unaligned9 = extern struct { a: u8, b: i64 align(1) };
+
+    const StackBlk = Block(struct { offset: i64 }, .{u8}, Unaligned9);
+    var stack_ctx = StackBlk.init(.{ .offset = 1000 }, &(struct {
+        fn run(ctx: *const StackBlk.Context, tag: u8) callconv(.c) Unaligned9 {
+            return .{ .a = tag + 1, .b = ctx.offset - @as(i64, tag) };
+        }
+    }).run);
+    try testing.expectEqual(cpkg.usesStret(Unaligned9), stack_ctx.flags.stret);
+
+    const direct_res = StackBlk.invoke(&stack_ctx, .{@as(u8, 7)});
+    try testing.expectEqual(@as(u8, 8), direct_res.a);
+    try testing.expectEqual(@as(i64, 993), direct_res.b);
+
+    const ref = StackBlk.asBlockRef(&stack_ctx);
+    const ref_res = ref.invoke(.{@as(u8, 9)});
+    try testing.expectEqual(@as(u8, 10), ref_res.a);
+    try testing.expectEqual(@as(i64, 991), ref_res.b);
+
+    // Also test global block + impImplementationWithBlock roundtrip via msgSend
+    const ImpBlk = Block(struct {}, .{ c.id, u8 }, Unaligned9);
+    const global_ctx = ImpBlk.initGlobal(&(struct {
+        fn run(_: *const ImpBlk.Context, _: c.id, tag: u8) callconv(.c) Unaligned9 {
+            return .{ .a = tag ^ 0xFF, .b = -@as(i64, tag) * 1_000_000_000 };
+        }
+    }).run);
+    try testing.expectEqual(cpkg.usesStret(Unaligned9), global_ctx.flags.stret);
+
+    const imp = impImplementationWithBlock(global_ctx);
+    defer _ = impRemoveBlock(imp);
+
+    const NSObject = objc.getClass("NSObject").?;
+    const Cls = objc.allocateClassPair(NSObject, "ZigObjcImpBlockUnaligned9").?;
+    defer objc.disposeClassPair(Cls);
+
+    const enc = comptime objc.comptimeEncode(fn (c.id, c.SEL, u8) callconv(.c) Unaligned9);
+    try testing.expect(Cls.addMethodRaw(objc.sel("buildUnaligned:"), imp, &enc));
+    objc.registerClassPair(Cls);
+
+    const inst = objc.allocInit(Cls).?;
+    defer inst.release();
+
+    const msg_res = inst.msgSend(Unaligned9, "buildUnaligned:", .{@as(u8, 0x0F)});
+    try testing.expectEqual(@as(u8, 0xF0), msg_res.a);
+    try testing.expectEqual(@as(i64, -15_000_000_000), msg_res.b);
 }
 
 test {

@@ -503,10 +503,24 @@ pub const EnumerateClassesFilter = struct {
     subclassing: ?Class = null,
 };
 
+const EnumerateClassesFn = *const fn (
+    ?*const anyopaque,
+    ?[*:0]const u8,
+    ?*c.Protocol,
+    c.Class,
+    *anyopaque,
+) callconv(.c) void;
+
+/// Reports whether `objc_enumerateClasses` (macOS 13.0+ / iOS 16.0+) is available
+/// in the running Objective-C runtime.
+pub fn hasEnumerateClasses() bool {
+    return cpkg.weakExtern(?EnumerateClassesFn, "objc_enumerateClasses") != null;
+}
+
 /// Enumerates Objective-C classes matching `filter` using a raw Clang block pointer or
 /// `BlockRef` (`void (^)(Class aClass, BOOL *stop)` via `objc_enumerateClasses`).
+/// Weak-linked for older deployment targets; no-ops if unavailable at runtime.
 pub fn enumerateClassesWithBlock(filter: EnumerateClassesFilter, blk: anytype) void {
-    if (!@hasDecl(c, "objc_enumerateClasses")) return;
     const T = @TypeOf(blk);
     const raw_blk: *anyopaque = switch (T) {
         *anyopaque => blk,
@@ -525,7 +539,8 @@ pub fn enumerateClassesWithBlock(filter: EnumerateClassesFilter, blk: anytype) v
             else => @compileError("enumerateClassesWithBlock expected a Block context pointer or BlockRef, got " ++ @typeName(T)),
         },
     };
-    c.objc_enumerateClasses(
+    const enum_fn = cpkg.weakExtern(?EnumerateClassesFn, "objc_enumerateClasses") orelse return;
+    enum_fn(
         filter.image,
         if (filter.name_prefix) |prefix| prefix.ptr else null,
         if (filter.conforming_to) |proto| proto.value else null,
@@ -536,12 +551,13 @@ pub fn enumerateClassesWithBlock(filter: EnumerateClassesFilter, blk: anytype) v
 
 /// Enumerates Objective-C classes matching `filter`, invoking `callback(context, cls, stop)`.
 /// Setting `stop.* = true` aborts enumeration immediately (`objc_enumerateClasses`).
+/// Weak-linked for older deployment targets; no-ops if unavailable at runtime.
 pub fn enumerateClasses(
     filter: EnumerateClassesFilter,
     context: anytype,
     comptime callback: fn (@TypeOf(context), Class, *bool) void,
 ) void {
-    if (!@hasDecl(c, "objc_enumerateClasses")) return;
+    if (!hasEnumerateClasses()) return;
     const ContextType = @TypeOf(context);
     if (@sizeOf(ContextType) == 0) {
         const EnumBlock = block_pkg.Block(struct {}, .{ c.Class, *c.BOOL }, void);
@@ -938,7 +954,7 @@ test "getClassList, copyClassList, and enumerateClasses" {
     try testing.expect(saw_nsobject);
 
     // Test enumerateClasses on dynamically registered classes with prefix, protocol, subclassing, and early stop.
-    if (@hasDecl(c, "objc_enumerateClasses")) {
+    if (hasEnumerateClasses()) {
         const copying_proto = objc.getProtocol("NSCopying") orelse return error.ProtocolNotFound;
 
         const Base = allocateClassPair(NSObject, "ZigObjcEnumDyn_Base").?;

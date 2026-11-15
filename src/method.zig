@@ -89,10 +89,12 @@ pub const Method = extern struct {
     /// Directly invokes this `Method` on `target` (`objc.Object`, `objc.Class`, or raw
     /// `c.id`/`c.Class`) with the given `Return` type and `args` tuple.
     ///
-    /// Routes through `method_invoke` (or `method_invoke_stret` on `x86_64` for aggregates
-    /// larger than 16 bytes). On `x86_64` 80-bit `long double` (`f80`), Apple does not
-    /// provide `method_invoke_fpret`, so this invokes `self.getImplementation()` directly
-    /// with `(receiver, self.getName().value, ...)` to preserve the x87 `%st(0)` return.
+    /// Routes through `method_invoke` (or `method_invoke_stret` on `x86_64` for SysV
+    /// `MEMORY`-class aggregates: `> 16` bytes, unaligned fields, or mixed `x87` unions).
+    /// On `x86_64` `[X87, X87UP]` returns (`f80` / `c_longdouble` and single-leaf `long double`
+    /// structs at offset 0), Apple does not provide `method_invoke_fpret`, so this invokes
+    /// `self.getImplementation()` directly with `(receiver, self.getName().value, ...)` to
+    /// preserve the x87 `%st(0)` return.
     pub fn invoke(
         self: Method,
         target: anytype,
@@ -104,9 +106,9 @@ pub const Method = extern struct {
         const Target = @TypeOf(target_val);
         const unwrapped_args = buildUnwrappedArgs(args);
 
-        if (comptime isX86LongDouble(RealReturn)) {
+        if (comptime cpkg.usesFpret(RealReturn)) {
             if (comptime (@typeInfo(Target) == .optional or (@typeInfo(Target) == .pointer and @typeInfo(Target).pointer.size == .c))) {
-                if (target_val == null) return 0;
+                if (target_val == null) return std.mem.zeroes(Return);
             }
             const ImpFn = InvokeFn(RealReturn, Target, c.SEL, @TypeOf(args));
             const imp = self.getImplementation() orelse unreachable;
@@ -128,47 +130,36 @@ pub const Method = extern struct {
     }
 };
 
-fn isX86LongDouble(comptime Return: type) bool {
-    if (builtin.target.cpu.arch != .x86_64) return false;
-    return switch (@typeInfo(Return)) {
-        .float => |float| Return == c_longdouble or float.bits == 80,
-        else => false,
-    };
-}
-
-/// Returns `&c.method_invoke` or `&c.method_invoke_stret` for a non-`f80` C-ABI return type.
+/// Returns `&c.method_invoke` or `&c.method_invoke_stret` for a non-`fpret` C-ABI return type.
 fn methodInvokePtr(comptime Return: type) *const fn () callconv(.c) void {
     return switch (builtin.target.cpu.arch) {
         .aarch64 => &c.method_invoke,
 
-        .x86_64 => switch (@typeInfo(Return)) {
-            inline .int,
-            .bool,
-            .@"enum",
-            .pointer,
-            .void,
-            .vector,
-            => &c.method_invoke,
+        .x86_64 => blk: {
+            assert(!cpkg.usesFpret(Return));
+            if (cpkg.usesStret(Return)) break :blk &c.method_invoke_stret;
+            switch (@typeInfo(Return)) {
+                .int,
+                .bool,
+                .@"enum",
+                .pointer,
+                .void,
+                .vector,
+                .float,
+                .@"struct",
+                .@"union",
+                => break :blk &c.method_invoke,
 
-            .optional => |opt| opt: {
-                assert(@typeInfo(opt.child) == .pointer);
-                break :opt &c.method_invoke;
-            },
+                .optional => |opt| {
+                    assert(@typeInfo(opt.child) == .pointer);
+                    break :blk &c.method_invoke;
+                },
 
-            .@"struct", .@"union" => if (@sizeOf(Return) > 16)
-                &c.method_invoke_stret
-            else
-                &c.method_invoke,
-
-            .float => |float| blk: {
-                assert(!(Return == c_longdouble or float.bits == 80));
-                break :blk &c.method_invoke;
-            },
-
-            else => {
-                @compileLog(@typeInfo(Return));
-                @compileError("unsupported return type for objc Method.invoke on x86_64");
-            },
+                else => {
+                    @compileLog(@typeInfo(Return));
+                    @compileError("unsupported return type for objc Method.invoke on x86_64");
+                },
+            }
         },
 
         else => @compileError("unsupported objc architecture"),
@@ -280,6 +271,8 @@ fn unwrapType(comptime T: type) type {
         .@"struct" => |s| {
             if (s.layout != .@"extern" and s.layout != .@"packed")
                 @compileError("Method.invoke: " ++ @typeName(T) ++ " — struct must be extern or packed");
+            if (s.layout == .@"packed" and @bitSizeOf(T) > 128)
+                @compileError("Method.invoke: " ++ @typeName(T) ++ " — packed struct larger than 128 bits is not C-ABI compatible");
         },
         .@"union" => |u| {
             if (u.layout != .@"extern")
@@ -358,21 +351,24 @@ test "Method ABI layout and InvokeFn signatures" {
 
     const Small = extern struct { a: u64, b: u64 };
     const Large = extern struct { a: u64, b: u64, d: u64 };
+    const LongDoubleWrap = extern struct { x: c_longdouble };
     if (builtin.target.cpu.arch == .x86_64) {
         try testing.expectEqual(&c.method_invoke, methodInvokePtr(f32));
         try testing.expectEqual(&c.method_invoke, methodInvokePtr(f64));
         try testing.expectEqual(&c.method_invoke, methodInvokePtr(Small));
         try testing.expectEqual(&c.method_invoke_stret, methodInvokePtr(Large));
-        try testing.expect(isX86LongDouble(c_longdouble));
-        try testing.expect(isX86LongDouble(f80));
-        try testing.expect(!isX86LongDouble(f64));
+        try testing.expect(cpkg.usesFpret(c_longdouble));
+        try testing.expect(cpkg.usesFpret(f80));
+        try testing.expect(cpkg.usesFpret(LongDoubleWrap));
+        try testing.expect(!cpkg.usesFpret(f64));
     } else if (builtin.target.cpu.arch == .aarch64) {
         try testing.expectEqual(&c.method_invoke, methodInvokePtr(f32));
         try testing.expectEqual(&c.method_invoke, methodInvokePtr(f64));
         try testing.expectEqual(&c.method_invoke, methodInvokePtr(c_longdouble));
         try testing.expectEqual(&c.method_invoke, methodInvokePtr(Small));
         try testing.expectEqual(&c.method_invoke, methodInvokePtr(Large));
-        try testing.expect(!isX86LongDouble(c_longdouble));
+        try testing.expect(!cpkg.usesFpret(c_longdouble));
+        try testing.expect(!cpkg.usesFpret(LongDoubleWrap));
     }
 }
 
@@ -711,4 +707,49 @@ test "Method.setImplementation and Method.exchangeImplementations swizzling" {
 
     Method.exchangeImplementations(m_alpha, m_swizzled);
     try testing.expectEqual(@as(i64, 15), inst.msgSend(i64, sel_alpha, .{@as(i64, 5)}));
+}
+
+test "Method.invoke with unaligned structs, packed structs, and long-double structs" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const Unaligned9 = extern struct { a: u8, b: i64 align(1) };
+    const TailPacked9 = extern struct { a: i64 align(1), b: u8 };
+    const Packed64 = packed struct(u64) { lo: u32, hi: u32 };
+    const LongDoubleWrap = extern struct { x: c_longdouble };
+
+    if (builtin.target.cpu.arch == .x86_64) {
+        try testing.expectEqual(&c.method_invoke_stret, methodInvokePtr(Unaligned9));
+        try testing.expectEqual(&c.method_invoke, methodInvokePtr(TailPacked9));
+        try testing.expectEqual(&c.method_invoke, methodInvokePtr(Packed64));
+    }
+
+    const NSObject = objc.getClass("NSObject").?;
+    const Cls = objc.allocateClassPair(NSObject, "ZigObjcMethodUnalignedAbi").?;
+    defer objc.disposeClassPair(Cls);
+
+    const impls = struct {
+        fn makeUnaligned(_: c.id, _: c.SEL, a: u8, b: i64) callconv(.c) Unaligned9 {
+            return .{ .a = a, .b = b };
+        }
+        fn makeLongDoubleWrap(_: c.id, _: c.SEL, v: c_longdouble) callconv(.c) LongDoubleWrap {
+            return .{ .x = v * 2.5 };
+        }
+    };
+    try testing.expect(Cls.addMethod("makeUnalignedA:b:", impls.makeUnaligned));
+    try testing.expect(Cls.addMethod("makeLongDoubleWrap:", impls.makeLongDoubleWrap));
+    objc.registerClassPair(Cls);
+
+    const inst = objc.allocInit(Cls).?;
+    defer inst.release();
+
+    const m_unaligned = Cls.getInstanceMethod(objc.sel("makeUnalignedA:b:")).?;
+    const got_unaligned = m_unaligned.invoke(inst, Unaligned9, .{ @as(u8, 0x3C), @as(i64, -9_876_543_210) });
+    try testing.expectEqual(@as(u8, 0x3C), got_unaligned.a);
+    try testing.expectEqual(@as(i64, -9_876_543_210), got_unaligned.b);
+
+    const m_ld_wrap = Cls.getInstanceMethod(objc.sel("makeLongDoubleWrap:")).?;
+    const got_ld = m_ld_wrap.invoke(inst, LongDoubleWrap, .{@as(c_longdouble, 3.0)});
+    try testing.expectApproxEqAbs(@as(f64, 7.5), @as(f64, @floatCast(got_ld.x)), 1e-12);
 }

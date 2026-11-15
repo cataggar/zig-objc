@@ -75,6 +75,7 @@ pub const getRequiredClass = class.getRequiredClass;
 pub const getMetaClass = class.getMetaClass;
 pub const getClassList = class.getClassList;
 pub const copyClassList = class.copyClassList;
+pub const hasEnumerateClasses = class.hasEnumerateClasses;
 pub const enumerateClasses = class.enumerateClasses;
 pub const enumerateClassesWithBlock = class.enumerateClassesWithBlock;
 pub const EnumerateClassesFilter = class.EnumerateClassesFilter;
@@ -148,19 +149,24 @@ pub const synchronize = sync.synchronize;
 // Dynamic library images, enumeration mutation, and runtime hooks (<objc/runtime.h>)
 pub const MachHeader = image.MachHeader;
 pub const copyImageNames = image.copyImageNames;
-pub const copyImageHeaders = if (@hasDecl(image, "copyImageHeaders")) image.copyImageHeaders else {};
+pub const hasCopyImageHeaders = image.hasCopyImageHeaders;
+pub const copyImageHeaders = image.copyImageHeaders;
 pub const getImageName = image.getImageName;
 pub const copyClassNamesForImage = image.copyClassNamesForImage;
 pub const EnumerationMutationHandler = image.EnumerationMutationHandler;
 pub const enumerationMutation = image.enumerationMutation;
 pub const setEnumerationMutationHandler = image.setEnumerationMutationHandler;
 pub const HookGetImageName = image.HookGetImageName;
+pub const hasSetHookGetImageName = image.hasSetHookGetImageName;
 pub const setHookGetImageName = image.setHookGetImageName;
 pub const HookGetClass = image.HookGetClass;
+pub const hasSetHookGetClass = image.hasSetHookGetClass;
 pub const setHookGetClass = image.setHookGetClass;
 pub const HookLazyClassNamer = image.HookLazyClassNamer;
+pub const hasSetHookLazyClassNamer = image.hasSetHookLazyClassNamer;
 pub const setHookLazyClassNamer = image.setHookLazyClassNamer;
 pub const LoadImageFunc = image.LoadImageFunc;
+pub const hasAddLoadImageFunc = image.hasAddLoadImageFunc;
 pub const addLoadImageFunc = image.addLoadImageFunc;
 
 /// Frees heap memory returned by Objective-C runtime `copy*` functions using
@@ -351,7 +357,7 @@ test "end-to-end integration: dynamic protocol, subclass, typed ivar, IMP-block,
     try testing.expect(WorkerClass.conformsToProtocol(worker_proto));
 
     // 3. Verify enumerateClasses discovers our dynamic class conforming to our dynamic protocol
-    if (@hasDecl(c, "objc_enumerateClasses")) {
+    if (hasEnumerateClasses()) {
         var found_worker = false;
         enumerateClasses(
             .{
