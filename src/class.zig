@@ -58,7 +58,7 @@ pub const Class = struct {
     // whose first two arguments are a `c.id` and a `c.SEL`.
     pub fn replaceMethod(self: Class, name: [:0]const u8, imp: anytype) void {
         const fn_info = @typeInfo(@TypeOf(imp)).@"fn";
-        assert(std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c));
+        assert(std.meta.eql(fn_info.attrs.@"callconv", std.lang.CallingConvention.c));
         assert(fn_info.attrs.varargs == false);
         assert(fn_info.param_types.len >= 2);
         assert(fn_info.param_types[0] == c.id);
@@ -72,7 +72,7 @@ pub const Class = struct {
     pub fn addMethod(self: Class, name: [:0]const u8, imp: anytype) bool {
         const Fn = @TypeOf(imp);
         const fn_info = @typeInfo(Fn).@"fn";
-        assert(std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c));
+        assert(std.meta.eql(fn_info.attrs.@"callconv", std.lang.CallingConvention.c));
         assert(fn_info.attrs.varargs == false);
         assert(fn_info.param_types.len >= 2);
         assert(fn_info.param_types[0] == c.id);

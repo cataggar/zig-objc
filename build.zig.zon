@@ -1,7 +1,7 @@
 .{
     .name = .zig_objc,
     .version = "0.0.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .fingerprint = 0x8a91772ba7d2bf22,
     .paths = .{
         "src/",
