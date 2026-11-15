@@ -122,7 +122,14 @@ pub fn addAppleSDK(b: *std.Build, m: *std.Build.Module) !void {
 }
 
 fn appleSDKPath(b: *std.Build, target: std.Build.ResolvedTarget) ![]const u8 {
-    if (b.option([]const u8, "apple-sdk", "Explicit target Apple SDK path (for cross compilation)")) |path| return path;
+    const OptionCache = struct {
+        var map: std.AutoHashMapUnmanaged(*const std.Build, ?[]const u8) = .{};
+    };
+    const opt_gop = try OptionCache.map.getOrPut(b.graph.arena, b);
+    if (!opt_gop.found_existing) {
+        opt_gop.value_ptr.* = b.option([]const u8, "apple-sdk", "Explicit target Apple SDK path (for cross compilation)");
+    }
+    if (opt_gop.value_ptr.*) |path| return path;
     // The cache. This always uses b.allocator and never frees memory
     // (which is idiomatic for a Zig build exe).
     const Cache = struct {

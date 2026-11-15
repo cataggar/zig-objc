@@ -317,7 +317,7 @@ test "?*u8 to Encoding.pointer encoding" {
 }
 
 test "Enum(c_uint) to Encoding.uint encoding" {
-    const TestEnum = enum(c_uint) {};
+    const TestEnum = enum(c_uint) { a };
     try encodingMatchesType(TestEnum, "I");
 }
 
