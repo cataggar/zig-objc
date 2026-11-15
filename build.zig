@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) !void {
     // Translate the Objective-C runtime headers once in the build so the Zig
     // code can import a stable generated module instead of invoking @cImport
     // from every compile.
-    const objc_c = try translateCModule(b, target, optimize);
+    const objc_c = try translateCModule(b, target);
 
     const objc = b.addModule("objc", .{
         .root_source_file = b.path("src/main.zig"),
@@ -55,7 +55,7 @@ fn configureModule(
     if (add_paths) try addAppleSDK(b, m);
     m.addCSourceFile(.{
         .file = b.path("src/exception_shim.m"),
-        .flags = &.{ "-x", "objective-c", "-fobjc-exceptions", "-fno-objc-arc" },
+        .flags = &.{ "-x", "objective-c", "-fobjc-exceptions", "-fno-objc-arc", "-funwind-tables" },
     });
     m.linkSystemLibrary("objc", .{});
     m.linkFramework("Foundation", .{});
@@ -70,7 +70,6 @@ fn configureModule(
 fn translateCModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
 ) !*std.Build.Module {
     const sdk_path = try appleSDKPath(b, target);
     const include_path = b.pathJoin(&.{ sdk_path, "/usr/include" });
@@ -120,7 +119,7 @@ fn translateCModule(
         .name = "objc-c",
         .c_source_file = import_h,
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
     });
     // Search the generated directory first so <objc/runtime.h> resolves to the
     // patched copy, while every other include still falls through to the SDK.

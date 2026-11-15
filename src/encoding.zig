@@ -4,28 +4,231 @@ const c = @import("c.zig").c;
 const assert = std.debug.assert;
 const testing = std.testing;
 
-/// how much space do we need to encode this type?
-fn comptimeN(comptime T: type) usize {
-    comptime {
-        const encoding = objc.Encoding.init(T);
+const max_parse_depth: usize = 64;
 
-        // Figure out how much space we need
-        return std.fmt.count("{f}", .{encoding});
+fn Encoded(comptime T: type) type {
+    return struct {
+        const slice: [:0]const u8 = comptimeEncodeInner(T, true, &.{}) ++ "";
+        const array: [slice.len:0]u8 = slice[0..slice.len :0].*;
+    };
+}
+
+/// Encode a type into a comptime null-terminated string in a single comptime pass.
+pub fn comptimeEncode(comptime T: type) [Encoded(T).slice.len:0]u8 {
+    return Encoded(T).array;
+}
+
+fn isObjcBlockType(comptime T: type) bool {
+    return @hasDecl(T, "is_objc_block") or @hasDecl(T, "zig_objc_is_block_ref");
+}
+
+fn containsType(comptime visited: []const type, comptime T: type) bool {
+    inline for (visited) |V| {
+        if (V == T) return true;
+    }
+    return false;
+}
+
+fn comptimeUintToStr(comptime n: usize) []const u8 {
+    if (n == 0) return "0";
+    var buf: [32]u8 = undefined;
+    var v = n;
+    var i: usize = buf.len;
+    while (v > 0) : (v /= 10) {
+        i -= 1;
+        buf[i] = @intCast('0' + (v % 10));
+    }
+    const result = buf[i..].*;
+    return &result;
+}
+
+fn packedUnionBackingInt(comptime T: type, comptime u: std.builtin.Type.Union) type {
+    if (@hasField(@TypeOf(u), "backing_integer")) {
+        if (u.backing_integer) |B| return B;
+    }
+    if (u.tag_type) |Tag| {
+        if (@typeInfo(Tag) == .int) return Tag;
+    }
+    return @Int(.unsigned, @bitSizeOf(T));
+}
+
+/// Strips leading module qualifiers outside generic parentheses and sanitizes any
+/// non-identifier characters (`not [A-Za-z0-9_]`) into collapsed `'_'` characters
+/// with trailing `'_'` removed.
+fn sanitizeTagName(comptime raw_type_name: []const u8) []const u8 {
+    comptime {
+        const paren_idx = std.mem.indexOfScalar(u8, raw_type_name, '(') orelse raw_type_name.len;
+        const prefix = raw_type_name[0..paren_idx];
+        const start = if (std.mem.lastIndexOfScalar(u8, prefix, '.')) |dot| dot + 1 else 0;
+        const stripped = raw_type_name[start..];
+
+        var buf: [stripped.len]u8 = undefined;
+        var out_len: usize = 0;
+        var prev_underscore = false;
+        for (stripped) |ch| {
+            if (std.ascii.isAlphanumeric(ch)) {
+                buf[out_len] = ch;
+                out_len += 1;
+                prev_underscore = false;
+            } else if (ch == '_') {
+                if (!prev_underscore) {
+                    buf[out_len] = '_';
+                    out_len += 1;
+                    prev_underscore = true;
+                }
+            } else {
+                if (!prev_underscore and out_len > 0) {
+                    buf[out_len] = '_';
+                    out_len += 1;
+                    prev_underscore = true;
+                }
+            }
+        }
+        while (out_len > 0 and buf[out_len - 1] == '_') {
+            out_len -= 1;
+        }
+        if (out_len == 0) return "?";
+        const final = buf[0..out_len].*;
+        return &final;
     }
 }
 
-/// Encode a type into a comptime string.
-pub fn comptimeEncode(comptime T: type) [comptimeN(T):0]u8 {
-    comptime {
-        const encoding = objc.Encoding.init(T);
+fn comptimeEncodeInner(
+    comptime T: type,
+    comptime show_type_spec: bool,
+    comptime visited: []const type,
+) []const u8 {
+    return comptime switch (T) {
+        i8, c_char => "c",
+        i16, c_short => "s",
+        i32, c_int => "i",
+        c_long => "l",
+        i64, c_longlong => "q",
+        isize => if (@sizeOf(isize) == 8) "q" else "i",
+        i128 => "t",
+        u8 => "C",
+        u16, c_ushort => "S",
+        u32, c_uint => "I",
+        c_ulong => "L",
+        u64, c_ulonglong => "Q",
+        usize => if (@sizeOf(usize) == 8) "Q" else "I",
+        u128 => "T",
+        f32 => "f",
+        f64 => "d",
+        f80, c_longdouble => "D",
+        bool => "B",
+        void, anyopaque => "v",
+        [*c]u8, [*c]const u8, [*:0]u8, [*:0]const u8 => "*",
+        c.SEL, objc.Sel, ?objc.Sel => ":",
+        c.Class, objc.Class, ?objc.Class => "#",
+        c.id,
+        objc.Object,
+        ?objc.Object,
+        objc.Protocol,
+        ?objc.Protocol,
+        *c.Protocol,
+        *const c.Protocol,
+        ?*c.Protocol,
+        ?*const c.Protocol,
+        => "@",
+        objc.Property, ?objc.Property => comptimeEncodeInner(c.objc_property_t, show_type_spec, visited),
+        objc.Ivar, ?objc.Ivar => comptimeEncodeInner(c.Ivar, show_type_spec, visited),
+        objc.Method, ?objc.Method => comptimeEncodeInner(c.Method, show_type_spec, visited),
+        else => switch (@typeInfo(T)) {
+            .@"opaque" => "v",
+            .@"enum" => |m| comptimeEncodeInner(m.tag_type, show_type_spec, visited),
+            .array => |arr| "[" ++ comptimeUintToStr(arr.len) ++ comptimeEncodeInner(arr.child, true, visited) ++ "]",
+            .vector => |vec| "![" ++ comptimeUintToStr(@sizeOf(T)) ++ "," ++ comptimeUintToStr(@alignOf(T)) ++ comptimeEncodeInner(vec.child, true, visited) ++ "]",
+            .@"struct" => |m| if (isObjcBlockType(T))
+                "@?"
+            else switch (m.layout) {
+                .@"packed" => comptimeEncodeInner(m.backing_integer.?, show_type_spec, visited),
+                .@"extern" => blk: {
+                    const tag_name = sanitizeTagName(@typeName(T));
+                    if (!show_type_spec or containsType(visited, T)) {
+                        break :blk "{" ++ tag_name ++ "}";
+                    }
+                    const next_visited = visited ++ &[_]type{T};
+                    var fields_str: []const u8 = "";
+                    for (m.field_types) |FieldType| {
+                        fields_str = fields_str ++ comptimeEncodeInner(FieldType, true, next_visited);
+                    }
+                    break :blk "{" ++ tag_name ++ "=" ++ fields_str ++ "}";
+                },
+                .auto => @compileError("Objective-C type encoding requires an extern or packed struct, got auto-layout struct " ++ @typeName(T)),
+            },
+            .@"union" => |u| switch (u.layout) {
+                .@"packed" => comptimeEncodeInner(packedUnionBackingInt(T, u), show_type_spec, visited),
+                .@"extern" => blk: {
+                    const tag_name = sanitizeTagName(@typeName(T));
+                    if (!show_type_spec or containsType(visited, T)) {
+                        break :blk "(" ++ tag_name ++ ")";
+                    }
+                    const next_visited = visited ++ &[_]type{T};
+                    var fields_str: []const u8 = "";
+                    for (u.field_types) |FieldType| {
+                        fields_str = fields_str ++ comptimeEncodeInner(FieldType, true, next_visited);
+                    }
+                    break :blk "(" ++ tag_name ++ "=" ++ fields_str ++ ")";
+                },
+                .auto => @compileError("Objective-C type encoding requires an extern or packed union, got auto-layout union " ++ @typeName(T)),
+            },
+            .optional => |m| switch (@typeInfo(m.child)) {
+                .@"struct" => if (isObjcBlockType(m.child))
+                    "@?"
+                else
+                    @compileError("unsupported non-pointer optional type: " ++ @typeName(T)),
+                .pointer => comptimeEncodeInner(m.child, show_type_spec, visited),
+                else => @compileError("unsupported non-pointer optional type: " ++ @typeName(T)),
+            },
+            .pointer => |ptr| switch (ptr.size) {
+                .one, .c => if (@typeInfo(ptr.child) == .@"fn")
+                    "^?"
+                else if (isBlockContextStruct(ptr.child))
+                    "@?"
+                else
+                    comptimeEncodePointer(T, visited),
+                .many => comptimeEncodePointer(T, visited),
+                .slice => @compileError("Objective-C type encoding does not support Zig slices: " ++ @typeName(T)),
+            },
+            .@"fn" => |fn_info| blk: {
+                if (!std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c)) {
+                    @compileError("Objective-C function encoding requires callconv(.c), got " ++ @typeName(T));
+                }
+                const RetType = fn_info.return_type orelse
+                    @compileError("Objective-C function encoding does not support generic return types: " ++ @typeName(T));
+                var sig: []const u8 = comptimeEncodeInner(RetType, true, visited);
+                for (fn_info.param_types) |maybe_param| {
+                    const P = maybe_param orelse
+                        @compileError("Objective-C function encoding does not support generic parameters: " ++ @typeName(T));
+                    sig = sig ++ comptimeEncodeInner(P, true, visited);
+                }
+                break :blk sig;
+            },
+            else => @compileError("unsupported type: " ++ @typeName(T)),
+        },
+    };
+}
 
-        // Build our final signature
-        var buf: [comptimeN(T) + 1]u8 = undefined;
-        const result = std.fmt.bufPrint(buf[0 .. buf.len - 1], "{f}", .{encoding}) catch unreachable;
-        buf[result.len] = 0;
+fn comptimeEncodePointer(comptime PtrType: type, comptime visited: []const type) []const u8 {
+    const pointer_info = indirectionCountAndType(PtrType);
+    const carets: [pointer_info.indirection_levels]u8 = @splat('^');
+    const Child = pointer_info.child;
 
-        return buf[0..result.len :0].*;
+    // Non-extern Zig structs/unions have no C field layout, so behind a pointer
+    // (`*MyZigState`) they encode as opaque `^v` (`void *`).
+    switch (@typeInfo(Child)) {
+        .@"struct" => |s| if (!isObjcBlockType(Child) and s.layout == .auto) {
+            return carets ++ "v";
+        },
+        .@"union" => |u| if (u.layout == .auto) {
+            return carets ++ "v";
+        },
+        else => {},
     }
+
+    const child_show_spec = (pointer_info.indirection_levels <= 1) and !containsType(visited, Child);
+    return carets ++ comptimeEncodeInner(Child, child_show_spec, visited);
 }
 
 /// Encoding union which parses type information and turns it into Obj-C
@@ -111,18 +314,21 @@ pub const Encoding = union(enum) {
                     .size = @sizeOf(T),
                     .alignment = @alignOf(T),
                 } },
-                .@"struct" => |m| if (@hasDecl(T, "is_objc_block"))
+                .@"struct" => |m| if (isObjcBlockType(T))
                     .block
                 else switch (m.layout) {
                     .@"packed" => .init(m.backing_integer.?),
                     else => .{ .structure = .{ .struct_type = T, .show_type_spec = true } },
                 },
-                .@"union" => .{ .@"union" = .{
-                    .union_type = T,
-                    .show_type_spec = true,
-                } },
+                .@"union" => |u| switch (u.layout) {
+                    .@"packed" => .init(packedUnionBackingInt(T, u)),
+                    else => .{ .@"union" = .{
+                        .union_type = T,
+                        .show_type_spec = true,
+                    } },
+                },
                 .optional => |m| switch (@typeInfo(m.child)) {
-                    .@"struct" => if (@hasDecl(m.child, "is_objc_block"))
+                    .@"struct" => if (isObjcBlockType(m.child))
                         .block
                     else
                         @compileError("unsupported non-pointer optional type: " ++ @typeName(T)),
@@ -137,9 +343,14 @@ pub const Encoding = union(enum) {
                     else
                         .{ .pointer = .{ .ptr_type = T, .size = ptr.size } },
                     .many => .{ .pointer = .{ .ptr_type = T, .size = ptr.size } },
-                    .slice => @compileError("Pointer size not supported for encoding"),
+                    .slice => @compileError("Objective-C type encoding does not support Zig slices: " ++ @typeName(T)),
                 },
-                .@"fn" => |fn_info| .{ .function = fn_info },
+                .@"fn" => |fn_info| blk: {
+                    if (comptime !std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c)) {
+                        @compileError("Objective-C function encoding requires callconv(.c), got " ++ @typeName(T));
+                    }
+                    break :blk .{ .function = fn_info };
+                },
                 else => @compileError("unsupported type: " ++ @typeName(T)),
             },
         };
@@ -148,6 +359,14 @@ pub const Encoding = union(enum) {
     pub fn format(
         comptime self: Encoding,
         writer: anytype,
+    ) !void {
+        try self.formatWithVisited(writer, &.{});
+    }
+
+    fn formatWithVisited(
+        comptime self: Encoding,
+        writer: anytype,
+        comptime visited: []const type,
     ) !void {
         switch (self) {
             .char => try writer.writeAll("c"),
@@ -176,32 +395,30 @@ pub const Encoding = union(enum) {
             .array => |a| {
                 try writer.print("[{}", .{a.len});
                 const encode_type = init(a.arr_type);
-                try encode_type.format(writer);
+                try encode_type.formatWithVisited(writer, visited);
                 try writer.writeAll("]");
             },
             .vector => |v| {
                 try writer.print("![{},{}", .{ v.size, v.alignment });
                 const elem_enc = init(v.elem_type);
-                try elem_enc.format(writer);
+                try elem_enc.formatWithVisited(writer, visited);
                 try writer.writeAll("]");
             },
             .structure => |s| {
                 const struct_info = @typeInfo(s.struct_type);
-                assert(struct_info.@"struct".layout == .@"extern");
+                if (struct_info.@"struct".layout != .@"extern") {
+                    @compileError("Objective-C type encoding requires an extern or packed struct, got auto-layout struct " ++ @typeName(s.struct_type));
+                }
 
-                // Strips the fully qualified type name to leave just the
-                // type name. Used in naming the Struct in an encoding.
-                var type_name_iter = std.mem.splitBackwardsScalar(u8, @typeName(s.struct_type), '.');
-                const type_name = type_name_iter.first();
+                const type_name = comptime sanitizeTagName(@typeName(s.struct_type));
                 try writer.print("{{{s}", .{type_name});
 
-                // if the encoding should show the internal type specification
-                // of the struct (determined by levels of pointer indirection)
-                if (s.show_type_spec) {
+                if (s.show_type_spec and !comptime containsType(visited, s.struct_type)) {
+                    const next_visited = visited ++ &[_]type{s.struct_type};
                     try writer.writeAll("=");
                     inline for (struct_info.@"struct".field_types) |field_type| {
                         const field_encode = init(field_type);
-                        try field_encode.format(writer);
+                        try field_encode.formatWithVisited(writer, next_visited);
                     }
                 }
 
@@ -209,21 +426,19 @@ pub const Encoding = union(enum) {
             },
             .@"union" => |u| {
                 const union_info = @typeInfo(u.union_type);
-                assert(union_info.@"union".layout == .@"extern");
+                if (union_info.@"union".layout != .@"extern") {
+                    @compileError("Objective-C type encoding requires an extern or packed union, got auto-layout union " ++ @typeName(u.union_type));
+                }
 
-                // Strips the fully qualified type name to leave just the
-                // type name. Used in naming the Union in an encoding
-                var type_name_iter = std.mem.splitBackwardsScalar(u8, @typeName(u.union_type), '.');
-                const type_name = type_name_iter.first();
+                const type_name = comptime sanitizeTagName(@typeName(u.union_type));
                 try writer.print("({s}", .{type_name});
 
-                // if the encoding should show the internal type specification
-                // of the Union (determined by levels of pointer indirection)
-                if (u.show_type_spec) {
+                if (u.show_type_spec and !comptime containsType(visited, u.union_type)) {
+                    const next_visited = visited ++ &[_]type{u.union_type};
                     try writer.writeAll("=");
                     inline for (union_info.@"union".field_types) |field_type| {
                         const field_encode = init(field_type);
-                        try field_encode.format(writer);
+                        try field_encode.formatWithVisited(writer, next_visited);
                     }
                 }
 
@@ -252,12 +467,9 @@ pub const Encoding = union(enum) {
                             else => {},
                         }
 
-                        // if the indirection levels are greater than 1, for
-                        // certain types that means getting rid of its
-                        // internal type specification
-                        //
-                        // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ObjCRuntimeGuide/Articles/ocrtTypeEncodings.html#//apple_ref/doc/uid/TP40008048-CH100
-                        if (pointer_info.indirection_levels > 1) {
+                        // Suppress aggregate field expansion for >= 2 levels of indirection
+                        // or when pointing back to an enclosing visited aggregate.
+                        if (comptime (pointer_info.indirection_levels > 1 or containsType(visited, pointer_info.child))) {
                             switch (encoding) {
                                 .structure => |*s| s.show_type_spec = false,
                                 .@"union" => |*u| u.show_type_spec = false,
@@ -265,20 +477,25 @@ pub const Encoding = union(enum) {
                             }
                         }
 
-                        try encoding.format(writer);
+                        try encoding.formatWithVisited(writer, visited);
                     },
-                    .slice => @compileError("Pointer size not supported for encoding"),
+                    .slice => @compileError("Objective-C type encoding does not support Zig slices: " ++ @typeName(p.ptr_type)),
                 }
             },
             .function => |fn_info| {
-                assert(std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c));
+                if (comptime !std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c)) {
+                    @compileError("Objective-C function encoding requires callconv(.c)");
+                }
+                const RetType = fn_info.return_type orelse
+                    @compileError("Objective-C function encoding does not support generic return types");
 
-                // Return type is first in a method encoding
-                const ret_type_enc = init(fn_info.return_type.?);
-                try ret_type_enc.format(writer);
+                const ret_type_enc = init(RetType);
+                try ret_type_enc.formatWithVisited(writer, visited);
                 inline for (fn_info.param_types) |param_type| {
-                    const param_enc = init(param_type.?);
-                    try param_enc.format(writer);
+                    const P = param_type orelse
+                        @compileError("Objective-C function encoding does not support generic parameters");
+                    const param_enc = init(P);
+                    try param_enc.formatWithVisited(writer, visited);
                 }
             },
             .unknown => try writer.writeAll("?"),
@@ -321,7 +538,7 @@ fn isDirectEncodedType(comptime T: type) bool {
         [*:0]const u8,
         => true,
         else => switch (@typeInfo(T)) {
-            .@"struct" => @hasDecl(T, "is_objc_block"),
+            .@"struct" => isObjcBlockType(T),
             .optional => |opt| isDirectEncodedType(opt.child),
             .pointer => |ptr| switch (ptr.size) {
                 .one, .c => @typeInfo(ptr.child) == .@"fn" or isBlockContextStruct(ptr.child),
@@ -343,7 +560,7 @@ fn indirectionCountAndType(comptime T: type) struct {
     while (!isDirectEncodedType(WalkType)) {
         switch (@typeInfo(WalkType)) {
             .pointer => |ptr| {
-                if (ptr.size == .slice) @compileError("Pointer size not supported for encoding");
+                if (ptr.size == .slice) @compileError("Objective-C type encoding does not support Zig slices: " ++ @typeName(T));
                 count += 1;
                 WalkType = ptr.child;
             },
@@ -369,6 +586,7 @@ pub const ParseError = error{
     InvalidNumber,
     UnclosedDelimiter,
     TrailingCharacters,
+    MaxDepthExceeded,
 };
 
 /// Objective-C runtime type qualifiers (`<objc/runtime.h>`).
@@ -528,9 +746,22 @@ pub fn parseType(enc: []const u8) ParseError!ParsedType {
     return res.parsed;
 }
 
+pub const TypePrefixResult = struct {
+    parsed: ParsedType,
+    rest: []const u8,
+};
+
 /// Parses a single Objective-C type descriptor from the front of `enc`, returning
 /// both the parsed descriptor and the remaining unconsumed slice.
-pub fn parseTypePrefix(enc: []const u8) ParseError!struct { parsed: ParsedType, rest: []const u8 } {
+pub fn parseTypePrefix(enc: []const u8) ParseError!TypePrefixResult {
+    return parseTypePrefixDepth(enc, 0);
+}
+
+fn parseTypePrefixDepth(
+    enc: []const u8,
+    depth: usize,
+) ParseError!TypePrefixResult {
+    if (depth > max_parse_depth) return error.MaxDepthExceeded;
     if (enc.len == 0) return error.EmptyEncoding;
 
     const qual_res = Qualifiers.parse(enc);
@@ -633,20 +864,21 @@ pub fn parseTypePrefix(enc: []const u8) ParseError!struct { parsed: ParsedType, 
                 idx += 1;
                 if (idx < enc.len and enc[idx] == '<') {
                     const sig_start = idx + 1;
-                    var depth: usize = 1;
+                    var angle_depth: usize = 1;
                     idx += 1;
-                    while (idx < enc.len and depth > 0) : (idx += 1) {
+                    while (idx < enc.len and angle_depth > 0) : (idx += 1) {
                         if (enc[idx] == '"') {
                             const close_q = std.mem.indexOfScalarPos(u8, enc, idx + 1, '"') orelse
                                 return error.UnclosedDelimiter;
                             idx = close_q;
                         } else if (enc[idx] == '<') {
-                            depth += 1;
+                            angle_depth += 1;
+                            if (angle_depth > max_parse_depth) return error.MaxDepthExceeded;
                         } else if (enc[idx] == '>') {
-                            depth -= 1;
+                            angle_depth -= 1;
                         }
                     }
-                    if (depth != 0) return error.UnclosedDelimiter;
+                    if (angle_depth != 0) return error.UnclosedDelimiter;
                     break :blk .{ .block = enc[sig_start .. idx - 1] };
                 } else if (idx < enc.len and enc[idx] == '"') {
                     const close_q = std.mem.indexOfScalarPos(u8, enc, idx + 1, '"') orelse
@@ -678,7 +910,7 @@ pub fn parseTypePrefix(enc: []const u8) ParseError!struct { parsed: ParsedType, 
                 idx += 1;
                 break :blk .fn_pointer;
             }
-            const sub = try parseTypePrefix(enc[idx..]);
+            const sub = try parseTypePrefixDepth(enc[idx..], depth + 1);
             idx += sub.parsed.raw.len;
             break :blk .{ .pointer = sub.parsed.raw };
         },
@@ -687,7 +919,7 @@ pub fn parseTypePrefix(enc: []const u8) ParseError!struct { parsed: ParsedType, 
             const len_res = try parseUintPrefix(usize, enc[idx..]);
             idx += len_res.consumed;
             if (idx >= enc.len) return error.UnclosedDelimiter;
-            const elem_res = try parseTypePrefix(enc[idx..]);
+            const elem_res = try parseTypePrefixDepth(enc[idx..], depth + 1);
             idx += elem_res.parsed.raw.len;
             if (idx >= enc.len or enc[idx] != ']') return error.UnclosedDelimiter;
             idx += 1;
@@ -743,7 +975,7 @@ pub fn parseTypePrefix(enc: []const u8) ParseError!struct { parsed: ParsedType, 
                     idx = close_q + 1;
                 }
                 if (idx >= enc.len or enc[idx] == close_ch) return error.UnexpectedEndOfInput;
-                const field_res = try parseTypePrefix(enc[idx..]);
+                const field_res = try parseTypePrefixDepth(enc[idx..], depth + 1);
                 idx += field_res.parsed.raw.len;
             }
             if (idx >= enc.len or enc[idx] != close_ch) return error.UnclosedDelimiter;
@@ -771,7 +1003,7 @@ pub fn parseTypePrefix(enc: []const u8) ParseError!struct { parsed: ParsedType, 
             if (idx < enc.len and enc[idx] == ',') idx += 1;
 
             if (idx >= enc.len) return error.UnclosedDelimiter;
-            const elem_res = try parseTypePrefix(enc[idx..]);
+            const elem_res = try parseTypePrefixDepth(enc[idx..], depth + 1);
             idx += elem_res.parsed.raw.len;
             if (idx >= enc.len or enc[idx] != ']') return error.UnclosedDelimiter;
             idx += 1;
@@ -882,10 +1114,12 @@ pub const MethodTypeIterator = struct {
 };
 
 fn encodingMatchesType(comptime T: type, expected_encoding: []const u8) !void {
-    var buf: [200]u8 = undefined;
+    var buf: [256]u8 = undefined;
     const enc = Encoding.init(T);
     const enc_string = try std.fmt.bufPrint(&buf, "{f}", .{enc});
     try testing.expectEqualStrings(expected_encoding, enc_string);
+    const ct_enc = comptime comptimeEncode(T);
+    try testing.expectEqualStrings(expected_encoding, &ct_enc);
 }
 
 test "i8 to Encoding.char encoding" {
@@ -1282,4 +1516,142 @@ test "MethodTypeIterator decodes synthetic and live runtime method signatures" {
     try testing.expect((try utf8_it.next()) != null);
     try testing.expect((try utf8_it.next()) != null);
     try testing.expect((try utf8_it.next()) == null);
+}
+
+fn TestGenericPair(comptime A: type, comptime B: type) type {
+    return extern struct {
+        first: A,
+        second: B,
+    };
+}
+
+fn TestGenericUnion(comptime A: type, comptime B: type) type {
+    return extern union {
+        first: A,
+        second: B,
+    };
+}
+
+test "generic extern struct and union name sanitization and parseType round-trip" {
+    try testing.expectEqualStrings("NSPoint", comptime sanitizeTagName("my_mod.NSPoint"));
+    try testing.expectEqualStrings("Pair_baz_Qux_u32", comptime sanitizeTagName("foo.bar.Pair(baz.Qux, u32)"));
+    try testing.expectEqualStrings("Pair_f64_u32", comptime sanitizeTagName("Pair(f64, u32)"));
+    try testing.expectEqualStrings("_Private_u32", comptime sanitizeTagName("mod._Private( u32 )"));
+
+    const InnerNs = struct {
+        pub const Item = extern struct { x: i32 };
+    };
+    const PairF64U32 = TestGenericPair(f64, u32);
+    const PairNested = TestGenericPair(InnerNs.Item, objc.Object);
+    const GenUnion = TestGenericUnion(i32, f64);
+
+    const pair_enc = comptime comptimeEncode(PairF64U32);
+    try testing.expectEqualStrings("{TestGenericPair_f64_u32=dI}", &pair_enc);
+    const parsed_pair = try parseType(&pair_enc);
+    try testing.expectEqualStrings("TestGenericPair_f64_u32", parsed_pair.kind.structure.name.?);
+    var it = parsed_pair.kind.structure.fieldIterator().?;
+    try testing.expectEqual(ParsedType.Kind.double, (try it.next()).?.ty.kind);
+    try testing.expectEqual(ParsedType.Kind.uint, (try it.next()).?.ty.kind);
+    try testing.expect((try it.next()) == null);
+
+    const nested_enc = comptime comptimeEncode(PairNested);
+    const parsed_nested = try parseType(&nested_enc);
+    try testing.expect(parsed_nested.kind == .structure);
+    try testing.expect(std.mem.indexOfScalar(u8, parsed_nested.kind.structure.name.?, '(') == null);
+    try testing.expect(std.mem.indexOfScalar(u8, parsed_nested.kind.structure.name.?, ')') == null);
+
+    const union_enc = comptime comptimeEncode(GenUnion);
+    try testing.expectEqualStrings("(TestGenericUnion_i32_f64=id)", &union_enc);
+    const parsed_union = try parseType(&union_enc);
+    try testing.expectEqualStrings("TestGenericUnion_i32_f64", parsed_union.kind.@"union".name.?);
+}
+
+test "self-referential extern struct and union cycle protection" {
+    const Node = extern struct {
+        const Self = @This();
+        next: ?*Self,
+        value: i32,
+    };
+
+    try encodingMatchesType(Node, "{Node=^{Node}i}");
+    try encodingMatchesType(*Node, "^{Node=^{Node}i}");
+    try encodingMatchesType(?*Node, "^{Node=^{Node}i}");
+    try encodingMatchesType(**Node, "^^{Node}");
+
+    const parsed_node = try parseType(&(comptime comptimeEncode(Node)));
+    try testing.expectEqualStrings("Node", parsed_node.kind.structure.name.?);
+    var fields = parsed_node.kind.structure.fieldIterator().?;
+    const next_field = (try fields.next()).?;
+    const next_pointee = (try next_field.ty.pointeeType()).?;
+    try testing.expectEqualStrings("Node", next_pointee.kind.structure.name.?);
+    try testing.expect(next_pointee.kind.structure.fields_encoding == null);
+    try testing.expectEqual(ParsedType.Kind.int, (try fields.next()).?.ty.kind);
+    try testing.expect((try fields.next()) == null);
+
+    // Mutually recursive structs and self-referential union
+    const Mutual = struct {
+        const A = extern struct { b: ?*B };
+        const B = extern struct { a: ?*A };
+    };
+    try encodingMatchesType(Mutual.A, "{A=^{B=^{A}}}");
+    try encodingMatchesType(*Mutual.A, "^{A=^{B=^{A}}}");
+
+    const UnionNode = extern union {
+        const Self = @This();
+        next: ?*Self,
+        raw: u64,
+    };
+    try encodingMatchesType(UnionNode, "(UnionNode=^(UnionNode)Q)");
+    try encodingMatchesType(*UnionNode, "^(UnionNode=^(UnionNode)Q)");
+
+    // Diamond (non-cycle) still expands both sibling pointer fields
+    const Leaf = extern struct { v: i32 };
+    const PairPtrs = extern struct { a: *Leaf, b: *Leaf };
+    try encodingMatchesType(PairPtrs, "{PairPtrs=^{Leaf=i}^{Leaf=i}}");
+}
+
+test "packed union and direct Object/Sel IMP function encodings" {
+    const PackedUnion32 = packed union {
+        bits: u32,
+        flt: f32,
+    };
+    const PackedUnion64 = packed union {
+        bits: u64,
+        dbl: f64,
+    };
+    try encodingMatchesType(PackedUnion32, "I");
+    try encodingMatchesType(*PackedUnion32, "^I");
+    try encodingMatchesType(PackedUnion64, "Q");
+
+    // Object and Sel as extern structs can now appear directly in callconv(.c) signatures.
+    try encodingMatchesType(fn (objc.Object, objc.Sel, i64) callconv(.c) objc.Object, "@@:q");
+}
+
+fn comptimeRepeat(comptime pat: []const u8, comptime count: usize) [pat.len * count]u8 {
+    comptime {
+        var out: [pat.len * count]u8 = undefined;
+        for (0..count) |i| {
+            @memcpy(out[i * pat.len ..][0..pat.len], pat);
+        }
+        return out;
+    }
+}
+
+test "parseType enforces max_parse_depth = 64 against stack overflow" {
+    const ok_ptrs = comptime (comptimeRepeat("^", 64) ++ "i");
+    const parsed_ok_ptrs = try parseType(ok_ptrs);
+    try testing.expect(parsed_ok_ptrs.kind == .pointer);
+
+    const too_deep_ptrs = comptime (comptimeRepeat("^", 65) ++ "i");
+    try testing.expectError(error.MaxDepthExceeded, parseType(too_deep_ptrs));
+
+    const ok_structs = comptime (comptimeRepeat("{S=", 64) ++ "i" ++ comptimeRepeat("}", 64));
+    const parsed_ok_structs = try parseType(ok_structs);
+    try testing.expect(parsed_ok_structs.kind == .structure);
+
+    const too_deep_structs = comptime (comptimeRepeat("{S=", 65) ++ "i" ++ comptimeRepeat("}", 65));
+    try testing.expectError(error.MaxDepthExceeded, parseType(too_deep_structs));
+
+    const too_deep_arrays = comptime (comptimeRepeat("[1", 65) ++ "i" ++ comptimeRepeat("]", 65));
+    try testing.expectError(error.MaxDepthExceeded, parseType(too_deep_arrays));
 }

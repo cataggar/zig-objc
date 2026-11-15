@@ -20,7 +20,7 @@ pub const AssociationPolicy = enum(c.objc_AssociationPolicy) {
 const OuterAssociationPolicy = AssociationPolicy;
 
 /// Object is an instance of a class.
-pub const Object = struct {
+pub const Object = extern struct {
     value: c.id,
 
     pub const AssociationPolicy = OuterAssociationPolicy;
@@ -34,7 +34,7 @@ pub const Object = struct {
 
     /// Convert a raw "id" into an Object. id must fit the size of the
     /// normal C "id" type (i.e. a `usize`).
-    pub fn fromId(id: anytype) Object {
+    pub inline fn fromId(id: anytype) Object {
         if (@sizeOf(@TypeOf(id)) != @sizeOf(c.id)) {
             @compileError("invalid id type");
         }

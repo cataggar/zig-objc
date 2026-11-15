@@ -12,7 +12,7 @@ pub const NSUIntegerMax = std.math.maxInt(NSUInteger);
 
 /// On some targets, Objective-C uses `i8` instead of `bool`.
 /// This helper casts a target value type to `bool`.
-pub fn boolResult(result: c.BOOL) bool {
+pub inline fn boolResult(result: c.BOOL) bool {
     return switch (c.BOOL) {
         bool => result,
         i8 => result != 0,
@@ -22,7 +22,7 @@ pub fn boolResult(result: c.BOOL) bool {
 
 /// On some targets, Objective-C uses `bool` or `i8`.
 /// This helper casts a `bool` value to the target value type.
-pub fn boolParam(param: bool) c.BOOL {
+pub inline fn boolParam(param: bool) c.BOOL {
     return switch (c.BOOL) {
         bool => param,
         i8 => @intFromBool(param),
@@ -30,21 +30,56 @@ pub fn boolParam(param: bool) c.BOOL {
     };
 }
 
+fn WeakExternReturn(comptime FnOrOptPtr: type) type {
+    return switch (@typeInfo(FnOrOptPtr)) {
+        .optional => |opt| if (@typeInfo(opt.child) == .pointer)
+            FnOrOptPtr
+        else
+            @compileError("weakExtern expected a pointer or optional pointer type, got " ++ @typeName(FnOrOptPtr)),
+        .pointer => ?FnOrOptPtr,
+        else => @compileError("weakExtern expected a pointer or optional pointer type, got " ++ @typeName(FnOrOptPtr)),
+    };
+}
+
 /// Resolves an optional weak Objective-C runtime symbol at runtime without
 /// emitting a strong undefined Mach-O reference when targeting older Apple OS
 /// deployment versions against a newer SDK.
 ///
-/// Returns `null` if the active SDK headers do not declare `name`, or if `dyld`
-/// resolves the weak symbol to `null` on an older host OS at runtime.
-pub fn weakExtern(comptime Ptr: type, comptime name: [:0]const u8) Ptr {
-    if (!@hasDecl(c, name)) return null;
-    var sym = @extern(Ptr, .{
-        .name = name,
-        .linkage = .weak,
-    });
-    // Force a runtime GOT load so ReleaseFast cannot fold `@extern` to non-null at comptime.
-    _ = &sym;
-    return sym;
+/// Caches the resolved pointer in a lock-free `.unordered` atomic static slot per
+/// `(Fn, symbol_name)` instantiation using a private sentinel address to distinguish
+/// "unresolved" from "resolved to `null`".
+pub inline fn weakExtern(comptime Fn: type, comptime symbol_name: []const u8) WeakExternReturn(Fn) {
+    const OptFn = WeakExternReturn(Fn);
+    if (!@hasDecl(c, symbol_name)) return null;
+
+    const Cache = struct {
+        var unresolved_sentinel: u8 = 0;
+        var slot: ?*const anyopaque = @ptrCast(&unresolved_sentinel);
+
+        noinline fn resolve() OptFn {
+            @branchHint(.unlikely);
+            var sym = @extern(OptFn, .{
+                .name = symbol_name,
+                .linkage = .weak,
+            });
+            // Force a runtime GOT load so ReleaseFast cannot fold `@extern` to non-null at comptime.
+            _ = &sym;
+            @atomicStore(
+                ?*const anyopaque,
+                &slot,
+                if (sym) |f| @ptrCast(f) else null,
+                .unordered,
+            );
+            return sym;
+        }
+    };
+
+    const cached = @atomicLoad(?*const anyopaque, &Cache.slot, .unordered);
+    if (cached != @as(?*const anyopaque, @ptrCast(&Cache.unresolved_sentinel))) {
+        const NonNullFn = @typeInfo(OptFn).optional.child;
+        return if (cached) |p| @as(NonNullFn, @ptrCast(@alignCast(p))) else null;
+    }
+    return Cache.resolve();
 }
 
 /// Reports whether `T` (at byte `base_offset` within an enclosing aggregate)
@@ -459,4 +494,27 @@ test "x86_64 SysV ABI stret and fpret classification" {
         try testing.expect(usesFpret(c_longdouble));
         try testing.expect(usesFpret(LongDoubleStruct));
     }
+}
+
+test "weakExtern caches resolved and missing runtime symbols" {
+    const testing = std.testing;
+
+    const GetClassFn = *const fn ([*c]const u8) callconv(.c) c.Class;
+    const p1 = weakExtern(GetClassFn, "objc_getClass");
+    const p2 = weakExtern(?GetClassFn, "objc_getClass");
+    const p3 = weakExtern(GetClassFn, "objc_getClass");
+    try testing.expect(p1 != null);
+    try testing.expectEqual(p1, p2);
+    try testing.expectEqual(p1, p3);
+    try testing.expect(p1.?("NSObject") != null);
+
+    // Missing SDK declaration returns null without emitting undefined Mach-O reference.
+    const missing1 = weakExtern(GetClassFn, "zig_objc_nonexistent_runtime_symbol");
+    const missing2 = weakExtern(?GetClassFn, "zig_objc_nonexistent_runtime_symbol");
+    try testing.expect(missing1 == null);
+    try testing.expect(missing2 == null);
+}
+
+test {
+    _ = @import("abi.zig");
 }
