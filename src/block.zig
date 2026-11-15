@@ -562,6 +562,8 @@ fn WrapperUnderlying(comptime T: type) ?type {
         objc.Protocol => *c.Protocol,
         objc.Sel => c.SEL,
         objc.Property => c.objc_property_t,
+        objc.Ivar => c.Ivar,
+        objc.Method => c.Method,
         else => null,
     };
 }

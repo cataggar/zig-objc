@@ -19,6 +19,8 @@ pub const Class = extern struct {
     const msg_send = MsgSend(Class);
     pub const msgSend = msg_send.msgSend;
     pub const msgSendSuper = msg_send.msgSendSuper;
+    pub const msgSendTry = msg_send.msgSendTry;
+    pub const msgSendSuperTry = msg_send.msgSendSuperTry;
 
     /// Returns the name of this class, or `""` if `self.value` is `null` (`class_getName`).
     pub fn getName(self: Class) [:0]const u8 {
@@ -899,7 +901,9 @@ test "getName, getSuperclass, getVersion/setVersion, getImageName, ivar layouts,
     try testing.expectEqual(@as(u64, 0xCAFE_BABE_DEAD_BEEF), extra_read.magic);
     try testing.expectEqual(@as(u64, 42), extra_read.tag);
 
-    // Null destructInstance is a safe no-op
+    // Null constructInstance / destructInstance are safe no-ops
+    try testing.expect(cls.constructInstance(null) == null);
+    try testing.expect(constructInstance(cls, null) == null);
     try testing.expect(destructInstance(.{ .value = null }) == null);
 }
 

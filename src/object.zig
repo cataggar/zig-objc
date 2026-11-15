@@ -6,6 +6,7 @@ const objc = @import("main.zig");
 const Ivar = @import("ivar.zig").Ivar;
 const MsgSend = @import("msg_send.zig").MsgSend;
 const Iterator = @import("iterator.zig").Iterator;
+const sync = @import("sync.zig");
 
 /// Memory management policies for Objective-C associated objects (`objc_setAssociatedObject`).
 pub const AssociationPolicy = enum(c.objc_AssociationPolicy) {
@@ -28,6 +29,8 @@ pub const Object = struct {
     const msg_send = MsgSend(Object);
     pub const msgSend = msg_send.msgSend;
     pub const msgSendSuper = msg_send.msgSendSuper;
+    pub const msgSendTry = msg_send.msgSendTry;
+    pub const msgSendSuperTry = msg_send.msgSendSuperTry;
 
     /// Convert a raw "id" into an Object. id must fit the size of the
     /// normal C "id" type (i.e. a `usize`).
@@ -170,8 +173,16 @@ pub const Object = struct {
     }
 
     pub fn setInstanceVariable(self: Object, name: [:0]const u8, val: ?Object) void {
-        const ivar = c.object_getInstanceVariable(self.value, name.ptr, null) orelse return;
-        c.object_setIvar(self.value, ivar, if (val) |v| v.value else null);
+        if (@hasDecl(c, "object_setInstanceVariable")) {
+            _ = c.object_setInstanceVariable(
+                self.value,
+                name.ptr,
+                if (val) |v| @ptrCast(v.value) else null,
+            );
+        } else {
+            const ivar = c.object_getInstanceVariable(self.value, name.ptr, null) orelse return;
+            c.object_setIvar(self.value, ivar, if (val) |v| v.value else null);
+        }
     }
 
     /// Sets an Objective-C object instance variable by name, defaulting unknown memory management to `strong`.
@@ -276,6 +287,12 @@ pub const Object = struct {
     /// Removes all associated objects from `self` (`objc_removeAssociatedObjects`).
     pub fn removeAssociatedObjects(self: Object) void {
         c.objc_removeAssociatedObjects(self.value);
+    }
+
+    /// Acquires the recursive `@synchronized` monitor for `self` (`objc_sync_enter`),
+    /// returning a `SyncGuard` whose `unlock()` releases the monitor (`objc_sync_exit`).
+    pub fn synchronize(self: Object) sync.SyncError!sync.SyncGuard {
+        return sync.synchronize(self);
     }
 
     pub fn retain(self: Object) Object {
@@ -779,4 +796,44 @@ test "alloc, allocInit, autorelease, ARC helpers, and storeStrong" {
     Object.storeStrong(&slot, null);
     try testing.expect(slot == null);
     try testing.expectEqual(@as(usize, 5), Stats.dealloc_count);
+}
+
+test "Object copy, dispose, isClass, setInstanceVariable, and synchronize" {
+    const testing = std.testing;
+    const NSObject = objc.getClass("NSObject").?;
+
+    const inst = Object.allocInit(NSObject).?;
+    defer inst.release();
+
+    // isClass distinguishes instances, classes, metaclasses, and nil
+    try testing.expect(!inst.isClass());
+    try testing.expect(!(Object{ .value = null }).isClass());
+    try testing.expect(Object.fromId(NSObject.value).isClass());
+    try testing.expect(Object.fromId(objc.getMetaClass("NSObject").?.value).isClass());
+
+    // object_copy + object_dispose
+    const copied = inst.copy(0);
+    try testing.expect(copied.value != null);
+    try testing.expect(copied.value != inst.value);
+    try testing.expectEqualStrings("NSObject", copied.getClassName());
+    copied.dispose();
+
+    // setInstanceVariable + getInstanceVariable
+    const Holder = objc.allocateClassPair(NSObject, "ZigObjcInstVarHolder").?;
+    try testing.expect(Holder.addIvar(?Object, "slot"));
+    objc.registerClassPair(Holder);
+    defer objc.disposeClassPair(Holder);
+
+    const holder = Object.allocInit(Holder).?;
+    defer holder.release();
+    holder.setInstanceVariable("slot", inst);
+    try testing.expectEqual(inst.value, holder.getInstanceVariable("slot").value);
+    holder.setInstanceVariable("slot", null);
+    try testing.expect(holder.getInstanceVariable("slot").value == null);
+
+    // Object.synchronize recursive monitor delegate
+    var outer_guard = try inst.synchronize();
+    defer outer_guard.unlock();
+    var inner_guard = try inst.synchronize();
+    inner_guard.unlock();
 }

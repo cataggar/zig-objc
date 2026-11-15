@@ -99,6 +99,9 @@ pub const Encoding = union(enum) {
             ?*c.Protocol,
             ?*const c.Protocol,
             => .object,
+            objc.Property, ?objc.Property => .init(c.objc_property_t),
+            objc.Ivar, ?objc.Ivar => .init(c.Ivar),
+            objc.Method, ?objc.Method => .init(c.Method),
             else => switch (@typeInfo(T)) {
                 .@"opaque" => .void,
                 .@"enum" => |m| .init(m.tag_type),
@@ -236,6 +239,18 @@ pub const Encoding = union(enum) {
                         }
 
                         comptime var encoding = init(pointer_info.child);
+
+                        // Non-extern Zig structs/unions have no C field layout, so behind a
+                        // pointer (`*MyZigState`) they encode as opaque `^v` (`void *`).
+                        switch (encoding) {
+                            .structure => |s| if (@typeInfo(s.struct_type).@"struct".layout != .@"extern") {
+                                encoding = .void;
+                            },
+                            .@"union" => |u| if (@typeInfo(u.union_type).@"union".layout != .@"extern") {
+                                encoding = .void;
+                            },
+                            else => {},
+                        }
 
                         // if the indirection levels are greater than 1, for
                         // certain types that means getting rid of its
@@ -989,6 +1004,22 @@ test "*TestOpaque to Encoding.pointer encoding" {
 test "?*TestOpaque to Encoding.pointer encoding" {
     const TestOpaque = opaque {};
     try encodingMatchesType(?*TestOpaque, "^v");
+}
+
+test "Property, Ivar, and Method wrapper encodings" {
+    try encodingMatchesType(objc.Property, "^v");
+    try encodingMatchesType(?objc.Property, "^v");
+    try encodingMatchesType(objc.Ivar, "^v");
+    try encodingMatchesType(?objc.Ivar, "^v");
+    try encodingMatchesType(objc.Method, "^v");
+    try encodingMatchesType(?objc.Method, "^v");
+
+    const ZigAutoState = struct {
+        count: usize,
+        label: []const u8,
+    };
+    try encodingMatchesType(*ZigAutoState, "^v");
+    try encodingMatchesType(?*ZigAutoState, "^v");
 }
 
 test "Union to Encoding.union encoding" {

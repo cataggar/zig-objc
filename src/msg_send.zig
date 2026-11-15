@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const cpkg = @import("c.zig");
 const c = cpkg.c;
+const exception = @import("exception.zig");
 const objc = @import("main.zig");
 
 /// Entry point for the Objective-C runtime's message forwarding machinery.
@@ -91,6 +92,29 @@ pub fn MsgSend(comptime T: type) type {
             return wrapReturn(Return, result);
         }
 
+        /// Invoke a selector on the target inside an Objective-C `@try / @catch`
+        /// frame, returning `exception.TryResult(Return)`.
+        pub fn msgSendTry(
+            target: T,
+            comptime Return: type,
+            sel_raw: anytype,
+            args: anytype,
+        ) exception.TryResult(Return) {
+            return exception.msgSendTry(target, Return, sel_raw, args);
+        }
+
+        /// Invoke a selector on the superclass inside an Objective-C `@try / @catch`
+        /// frame, returning `exception.TryResult(Return)`.
+        pub fn msgSendSuperTry(
+            target: T,
+            superclass: objc.Class,
+            comptime Return: type,
+            sel_raw: anytype,
+            args: anytype,
+        ) exception.TryResult(Return) {
+            return exception.msgSendSuperTry(target, superclass, Return, sel_raw, args);
+        }
+
         /// Returns the objc_msgSend or objc_msgSendSuper pointer for the
         /// given C-ABI return type.
         fn msgSendPtr(
@@ -145,7 +169,7 @@ pub fn MsgSend(comptime T: type) type {
 }
 
 /// If `T` is an `objc` runtime handle wrapper (`Object`, `Class`, `Protocol`,
-/// `Sel`, or `Property`), returns its underlying C ABI pointer type.
+/// `Sel`, `Property`, `Ivar`, or `Method`), returns its underlying C ABI pointer type.
 fn WrapperUnderlying(comptime T: type) ?type {
     return switch (T) {
         objc.Object => c.id,
@@ -153,6 +177,8 @@ fn WrapperUnderlying(comptime T: type) ?type {
         objc.Protocol => *c.Protocol,
         objc.Sel => c.SEL,
         objc.Property => c.objc_property_t,
+        objc.Ivar => c.Ivar,
+        objc.Method => c.Method,
         else => null,
     };
 }
@@ -493,4 +519,85 @@ test "msgForward" {
 
     const len = proxy.msgSend(objc.NSUInteger, "length", .{});
     try testing.expectEqual(@as(objc.NSUInteger, 10), len);
+}
+
+test "WrapperUnderlying Ivar/Method and msgSendTry/msgSendSuperTry delegates" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSObject = objc.getClass("NSObject").?;
+
+    const Base = objc.allocateClassPair(NSObject, "ZigObjcMsgSendTryBase").?;
+    defer objc.disposeClassPair(Base);
+    try testing.expect(Base.addIvar(usize, "sample_ivar"));
+    try testing.expect(Base.addMethod("echoIvar:", struct {
+        fn imp(_: c.id, _: c.SEL, iv: c.Ivar) callconv(.c) c.Ivar {
+            return iv;
+        }
+    }.imp));
+    try testing.expect(Base.addMethod("echoMethod:", struct {
+        fn imp(_: c.id, _: c.SEL, m: c.Method) callconv(.c) c.Method {
+            return m;
+        }
+    }.imp));
+    try testing.expect(Base.addMethod("checkPositive:", struct {
+        fn imp(_: c.id, _: c.SEL, val: i64) callconv(.c) i64 {
+            if (val < 0) {
+                const NSString = objc.getClass("NSString").?;
+                const NSException = objc.getClass("NSException").?;
+                const name = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"ZigNegativeError"});
+                const reason = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"negative input"});
+                const exc = NSException.msgSend(
+                    objc.Object,
+                    "exceptionWithName:reason:userInfo:",
+                    .{ name, reason, @as(?objc.Object, null) },
+                );
+                objc.exception.throw(exc);
+            }
+            return val * 2;
+        }
+    }.imp));
+    objc.registerClassPair(Base);
+
+    const Sub = objc.allocateClassPair(Base, "ZigObjcMsgSendTrySub").?;
+    defer objc.disposeClassPair(Sub);
+    objc.registerClassPair(Sub);
+
+    const inst = objc.allocInit(Sub).?;
+    defer inst.release();
+
+    const iv = Base.getInstanceVariable("sample_ivar").?;
+    const got_iv = inst.msgSend(?objc.Ivar, "echoIvar:", .{iv});
+    try testing.expectEqual(iv.value, got_iv.?.value);
+    try testing.expect(inst.msgSend(?objc.Ivar, "echoIvar:", .{@as(?objc.Ivar, null)}) == null);
+
+    const m = Base.getInstanceMethod(objc.sel("echoMethod:")).?;
+    const got_m = inst.msgSend(?objc.Method, "echoMethod:", .{m});
+    try testing.expectEqual(m.value, got_m.?.value);
+    try testing.expect(inst.msgSend(?objc.Method, "echoMethod:", .{@as(?objc.Method, null)}) == null);
+
+    // Delegate msgSendTry and msgSendSuperTry on Object and Class
+    switch (inst.msgSendTry(i64, "checkPositive:", .{@as(i64, 21)})) {
+        .ok => |v| try testing.expectEqual(@as(i64, 42), v),
+        .exception => return error.UnexpectedException,
+    }
+    switch (inst.msgSendTry(i64, "checkPositive:", .{@as(i64, -1)})) {
+        .ok => return error.ExpectedException,
+        .exception => |exc_opt| {
+            const exc = exc_opt orelse return error.NullException;
+            defer exc.release();
+        },
+    }
+    switch (inst.msgSendSuperTry(Base, i64, "checkPositive:", .{@as(i64, -5)})) {
+        .ok => return error.ExpectedException,
+        .exception => |exc_opt| {
+            const exc = exc_opt orelse return error.NullException;
+            defer exc.release();
+        },
+    }
+    switch (NSObject.msgSendTry(objc.Class, "class", .{})) {
+        .ok => |cls| try testing.expectEqual(NSObject.value, cls.value),
+        .exception => return error.UnexpectedException,
+    }
 }

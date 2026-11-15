@@ -11,7 +11,23 @@ pub const AutoreleasePool = opaque {
     }
 };
 
-// I'm not sure if these are internal or not... they aren't in any headers,
-// but its how autorelease pools are implemented.
+// Clang `@autoreleasepool` Objective-C runtime ABI symbols exported by `libobjc.A.dylib`.
 extern "c" fn objc_autoreleasePoolPush() ?*anyopaque;
 extern "c" fn objc_autoreleasePoolPop(?*anyopaque) void;
+
+test "AutoreleasePool push and pop" {
+    const objc = @import("main.zig");
+    const NSObject = objc.getClass("NSObject").?;
+
+    const outer = AutoreleasePool.init();
+    defer outer.deinit();
+
+    {
+        const inner = AutoreleasePool.init();
+        defer inner.deinit();
+
+        const obj = objc.allocInit(NSObject).?;
+        _ = obj.autorelease();
+        try std.testing.expectEqual(@as(objc.NSUInteger, 1), obj.msgSend(objc.NSUInteger, "retainCount", .{}));
+    }
+}
