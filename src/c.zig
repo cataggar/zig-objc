@@ -117,40 +117,16 @@ fn mergeX86_64Class(a: X86_64Class, b: X86_64Class) X86_64Class {
     return .sse;
 }
 
-fn containsX86_64LongDouble(comptime T: type) bool {
-    return comptime blk: {
-        if (T == c_longdouble or T == f80) break :blk true;
-        break :blk switch (@typeInfo(T)) {
-            .float => |f| f.bits == 80,
-            .@"struct" => |s| inner: {
-                if (s.layout == .@"packed") break :inner false;
-                for (s.field_types) |FieldType| {
-                    if (containsX86_64LongDouble(FieldType)) break :inner true;
-                }
-                break :inner false;
-            },
-            .@"union" => |u| inner: {
-                if (u.layout == .@"packed") break :inner false;
-                for (u.field_types) |FieldType| {
-                    if (containsX86_64LongDouble(FieldType)) break :inner true;
-                }
-                break :inner false;
-            },
-            .array => |arr| arr.len > 0 and containsX86_64LongDouble(arr.child),
-            else => false,
-        };
-    };
-}
-
 fn classifyX86_64Field(
     comptime T: type,
     comptime offset: usize,
-    classes: *[2]X86_64Class,
+    comptime max_bytes: usize,
+    classes: *[8]X86_64Class,
 ) bool {
     if (T == c_longdouble or T == f80 or (@typeInfo(T) == .float and @typeInfo(T).float.bits == 80)) {
-        if (offset != 0) return false;
-        classes[0] = mergeX86_64Class(classes[0], .x87);
-        classes[1] = mergeX86_64Class(classes[1], .x87up);
+        if (offset + 16 > max_bytes) return false;
+        classes[offset / 8] = mergeX86_64Class(classes[offset / 8], .x87);
+        classes[(offset / 8) + 1] = mergeX86_64Class(classes[(offset / 8) + 1], .x87up);
         return true;
     }
 
@@ -159,10 +135,12 @@ fn classifyX86_64Field(
         .@"struct" => |s| switch (s.layout) {
             .@"packed" => {
                 if (@bitSizeOf(T) == 0) return true;
-                if (offset + @sizeOf(T) > 16) return false;
-                classes[offset / 8] = mergeX86_64Class(classes[offset / 8], .integer);
-                if ((offset + @sizeOf(T) - 1) / 8 != offset / 8) {
-                    classes[1] = mergeX86_64Class(classes[1], .integer);
+                if (offset + @sizeOf(T) > max_bytes) return false;
+                const start_eb = offset / 8;
+                const end_eb = (offset + @sizeOf(T) - 1) / 8;
+                var eb = start_eb;
+                while (eb <= end_eb) : (eb += 1) {
+                    classes[eb] = mergeX86_64Class(classes[eb], .integer);
                 }
                 return true;
             },
@@ -173,14 +151,14 @@ fn classifyX86_64Field(
                 inline for (s.field_names, s.field_types) |field_name, FieldType| {
                     if (@sizeOf(FieldType) > 0) {
                         non_empty_fields += 1;
-                        if (comptime containsX86_64LongDouble(FieldType)) has_ld_field = true;
+                        if (FieldType == c_longdouble or FieldType == f80 or (@typeInfo(FieldType) == .float and @typeInfo(FieldType).float.bits == 80)) {
+                            has_ld_field = true;
+                        }
                     }
-                    if (!classifyX86_64Field(FieldType, offset + @offsetOf(T, field_name), classes)) {
+                    if (!classifyX86_64Field(FieldType, offset + @offsetOf(T, field_name), max_bytes, classes)) {
                         return false;
                     }
                 }
-                // On x86_64, `long double` is 16 bytes, so combining it with any other
-                // non-empty struct field always exceeds the 16-byte register threshold.
                 if (has_ld_field and non_empty_fields > 1) return false;
                 return true;
             },
@@ -189,17 +167,19 @@ fn classifyX86_64Field(
         .@"union" => |u| switch (u.layout) {
             .@"packed" => {
                 if (@bitSizeOf(T) == 0) return true;
-                if (offset + @sizeOf(T) > 16) return false;
-                classes[offset / 8] = mergeX86_64Class(classes[offset / 8], .integer);
-                if ((offset + @sizeOf(T) - 1) / 8 != offset / 8) {
-                    classes[1] = mergeX86_64Class(classes[1], .integer);
+                if (offset + @sizeOf(T) > max_bytes) return false;
+                const start_eb = offset / 8;
+                const end_eb = (offset + @sizeOf(T) - 1) / 8;
+                var eb = start_eb;
+                while (eb <= end_eb) : (eb += 1) {
+                    classes[eb] = mergeX86_64Class(classes[eb], .integer);
                 }
                 return true;
             },
             .@"extern" => {
                 if (@sizeOf(T) == 0) return true;
                 inline for (u.field_types) |FieldType| {
-                    if (!classifyX86_64Field(FieldType, offset, classes)) {
+                    if (!classifyX86_64Field(FieldType, offset, max_bytes, classes)) {
                         return false;
                     }
                 }
@@ -209,61 +189,122 @@ fn classifyX86_64Field(
         },
         .array => |arr| {
             if (arr.len == 0 or @sizeOf(arr.child) == 0) return true;
-            if (offset + @sizeOf(T) > 16) return false;
+            if (offset + @sizeOf(T) > max_bytes) return false;
             inline for (0..arr.len) |idx| {
-                if (!classifyX86_64Field(arr.child, offset + idx * @sizeOf(arr.child), classes)) {
+                if (!classifyX86_64Field(arr.child, offset + idx * @sizeOf(arr.child), max_bytes, classes)) {
                     return false;
                 }
             }
             return true;
         },
         .float => |f| {
-            if (offset + @sizeOf(T) > 16) return false;
+            if (offset + @sizeOf(T) > max_bytes) return false;
+            const start_eb = offset / 8;
+            classes[start_eb] = mergeX86_64Class(classes[start_eb], .sse);
             if (f.bits == 128) {
-                if (offset != 0) return false;
-                classes[0] = mergeX86_64Class(classes[0], .sse);
-                classes[1] = mergeX86_64Class(classes[1], .sseup);
-            } else {
-                classes[offset / 8] = mergeX86_64Class(classes[offset / 8], .sse);
+                classes[start_eb + 1] = mergeX86_64Class(classes[start_eb + 1], .sseup);
             }
             return true;
         },
         .vector => {
             if (@sizeOf(T) == 0) return true;
-            if (offset + @sizeOf(T) > 16) return false;
-            classes[offset / 8] = mergeX86_64Class(classes[offset / 8], .sse);
-            if (@sizeOf(T) > 8) {
-                classes[1] = mergeX86_64Class(classes[1], .sseup);
+            if (offset + @sizeOf(T) > max_bytes) return false;
+            const start_eb = offset / 8;
+            const end_eb = (offset + @sizeOf(T) - 1) / 8;
+            classes[start_eb] = mergeX86_64Class(classes[start_eb], .sse);
+            var eb = start_eb + 1;
+            while (eb <= end_eb) : (eb += 1) {
+                classes[eb] = mergeX86_64Class(classes[eb], .sseup);
             }
             return true;
         },
         else => {
             if (@sizeOf(T) == 0) return true;
-            if (offset + @sizeOf(T) > 16) return false;
-            classes[offset / 8] = mergeX86_64Class(classes[offset / 8], .integer);
-            if ((offset + @sizeOf(T) - 1) / 8 != offset / 8) {
-                classes[1] = mergeX86_64Class(classes[1], .integer);
+            if (offset + @sizeOf(T) > max_bytes) return false;
+            const start_eb = offset / 8;
+            const end_eb = (offset + @sizeOf(T) - 1) / 8;
+            var eb = start_eb;
+            while (eb <= end_eb) : (eb += 1) {
+                classes[eb] = mergeX86_64Class(classes[eb], .integer);
             }
             return true;
         },
     }
 }
 
-fn classifyX86_64Aggregate(comptime T: type) X86_64Class {
+fn classifyX86_64AggregateWithSimd(
+    comptime T: type,
+    comptime has_avx: bool,
+    comptime has_avx512f: bool,
+) X86_64Class {
     return comptime blk: {
-        if (@sizeOf(T) > 16) break :blk .memory;
+        const max_bytes: usize = if (has_avx512f) 64 else if (has_avx) 32 else 16;
+        if (@sizeOf(T) > max_bytes) break :blk .memory;
         if (hasUnalignedFields(T, 0)) break :blk .memory;
         if (@sizeOf(T) == 0) break :blk .no_class;
 
-        var classes: [2]X86_64Class = .{ .no_class, .no_class };
-        if (!classifyX86_64Field(T, 0, &classes)) break :blk .memory;
+        var num_eightbytes: usize = (@sizeOf(T) + 7) / 8;
+        var classes: [8]X86_64Class = @splat(.no_class);
+        if (!classifyX86_64Field(T, 0, max_bytes, &classes)) break :blk .memory;
+        for (classes, 0..) |cls, idx| {
+            if (cls != .no_class and idx + 1 > num_eightbytes) num_eightbytes = idx + 1;
+        }
 
         // SysV AMD64 ABI §3.2.3 post-merger cleanup (Rule 5):
-        if (classes[0] == .memory or classes[1] == .memory) break :blk .memory;
-        if (classes[0] == .x87up) break :blk .memory;
-        if (classes[1] == .x87up and classes[0] != .x87) break :blk .memory;
-        if (classes[0] == .x87 and classes[1] == .x87up) break :blk .x87;
+        // (a) If one of the classes is MEMORY, the whole argument is passed in memory.
+        // (b) If X87UP is not preceded by X87, the whole argument is passed in memory.
+        for (classes[0..num_eightbytes], 0..) |cls, i| {
+            if (cls == .memory) break :blk .memory;
+            if (cls == .x87up and (i == 0 or classes[i - 1] != .x87)) break :blk .memory;
+        }
+
+        // (c) If the size of the aggregate exceeds two eightbytes and the first
+        // eightbyte isn't SSE or any other eightbyte isn't SSEUP, pass in memory.
+        if (@sizeOf(T) > 16) {
+            if (classes[0] != .sse) break :blk .memory;
+            for (classes[1..num_eightbytes]) |cls| {
+                if (cls != .sseup) break :blk .memory;
+            }
+            break :blk .sse;
+        }
+
+        // For <= 16B aggregates, only pure [X87, X87UP] returns in %st(0); mixed
+        // [X87, SSE/INTEGER] returns in registers (%st(0)+...) or memory? On SysV
+        // AMD64, [X87, INTEGER] / [X87, SSE] is valid only when X87 is paired with X87UP
+        // because an 80-bit x87 value always spans 10 bytes (two eightbytes).
+        if (num_eightbytes == 2 and classes[0] == .x87 and classes[1] == .x87up) break :blk .x87;
+        if (classes[0] == .x87 or (num_eightbytes == 2 and classes[1] == .x87)) break :blk .memory;
         break :blk classes[0];
+    };
+}
+
+fn classifyX86_64Aggregate(comptime T: type) X86_64Class {
+    const has_avx = builtin.target.cpu.arch == .x86_64 and
+        std.Target.x86.featureSetHas(builtin.target.cpu.features, .avx);
+    const has_avx512f = builtin.target.cpu.arch == .x86_64 and
+        std.Target.x86.featureSetHas(builtin.target.cpu.features, .avx512f);
+    return classifyX86_64AggregateWithSimd(T, has_avx, has_avx512f);
+}
+
+/// Variant of `x86_64AggregateUsesStret` parameterized by AVX / AVX-512F target
+/// feature availability so tests on any host architecture can verify SIMD rules.
+pub fn x86_64AggregateUsesStretWithSimd(
+    comptime T: type,
+    comptime has_avx: bool,
+    comptime has_avx512f: bool,
+) bool {
+    return comptime switch (@typeInfo(T)) {
+        .@"struct" => |s| switch (s.layout) {
+            .@"packed" => false,
+            .@"extern" => classifyX86_64AggregateWithSimd(T, has_avx, has_avx512f) == .memory,
+            .auto => @compileError("x86_64AggregateUsesStret requires an extern or packed struct, got " ++ @typeName(T)),
+        },
+        .@"union" => |u| switch (u.layout) {
+            .@"packed" => false,
+            .@"extern" => classifyX86_64AggregateWithSimd(T, has_avx, has_avx512f) == .memory,
+            .auto => @compileError("x86_64AggregateUsesStret requires an extern or packed union, got " ++ @typeName(T)),
+        },
+        else => false,
     };
 }
 
@@ -395,6 +436,16 @@ test "x86_64 SysV ABI stret and fpret classification" {
     try testing.expect(!x86_64UsesFpret(LongDoublePlusByte));
     try testing.expect(!x86_64UsesFpret(MixedLongDoubleFloatUnion));
     try testing.expect(!x86_64UsesFpret(MixedLongDoubleIntUnion));
+
+    // SIMD vectors and 128-bit float aggregates (Zig forbids @Vector fields inside
+    // extern structs/unions; standalone @Vector and 16B f128 structs return in SSE/YMM/ZMM)
+    const F128Struct = extern struct { v: f128 };
+    const TwoF128Struct = extern struct { lo: f128, hi: f128 };
+    try testing.expect(!x86_64AggregateUsesStret(@Vector(8, f32)));
+    try testing.expect(!x86_64AggregateUsesStret(@Vector(16, f32)));
+    try testing.expect(!x86_64AggregateUsesStretWithSimd(F128Struct, false, false));
+    try testing.expect(x86_64AggregateUsesStretWithSimd(TwoF128Struct, false, false));
+    try testing.expect(x86_64AggregateUsesStretWithSimd(TwoF128Struct, true, true));
 
     if (builtin.target.cpu.arch == .aarch64) {
         try testing.expect(!usesStret(Large24));
