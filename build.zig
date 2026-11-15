@@ -53,6 +53,10 @@ fn configureModule(
     m.link_libc = true;
     m.addImport("objc-c", objc_c);
     if (add_paths) try addAppleSDK(b, m);
+    m.addCSourceFile(.{
+        .file = b.path("src/exception_shim.m"),
+        .flags = &.{ "-x", "objective-c", "-fobjc-exceptions", "-fno-objc-arc" },
+    });
     m.linkSystemLibrary("objc", .{});
     m.linkFramework("Foundation", .{});
 }
