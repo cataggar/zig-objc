@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const abi = @import("abi.zig");
 const cpkg = @import("c.zig");
 const c = cpkg.c;
 const objc = @import("main.zig");
@@ -14,25 +15,25 @@ pub const Method = extern struct {
     value: c.Method,
 
     /// Returns the selector naming this method (`method_getName`).
-    pub fn getName(self: Method) objc.Sel {
+    pub inline fn getName(self: Method) objc.Sel {
         return .{ .value = c.method_getName(self.value) };
     }
 
     /// Returns the `IMP` function pointer implementing this method (`method_getImplementation`).
-    pub fn getImplementation(self: Method) c.IMP {
+    pub inline fn getImplementation(self: Method) c.IMP {
         return c.method_getImplementation(self.value);
     }
 
     /// Returns the Objective-C type encoding string describing the method's return
     /// and parameter types, or `null` if unavailable (`method_getTypeEncoding`).
-    pub fn getTypeEncoding(self: Method) ?[:0]const u8 {
+    pub inline fn getTypeEncoding(self: Method) ?[:0]const u8 {
         const ptr: ?[*:0]const u8 = c.method_getTypeEncoding(self.value);
         return std.mem.span(ptr orelse return null);
     }
 
     /// Returns the total number of arguments accepted by the method, including the
     /// implicit `self` (`0`) and `_cmd` (`1`) parameters (`method_getNumberOfArguments`).
-    pub fn getNumberOfArguments(self: Method) u32 {
+    pub inline fn getNumberOfArguments(self: Method) u32 {
         return @intCast(c.method_getNumberOfArguments(self.value));
     }
 
@@ -70,19 +71,19 @@ pub const Method = extern struct {
 
     /// Returns a pointer to the runtime `objc_method_description` structure for this
     /// method (`method_getDescription`).
-    pub fn getDescription(self: Method) *const MethodDescription {
+    pub inline fn getDescription(self: Method) *const MethodDescription {
         return c.method_getDescription(self.value);
     }
 
     /// Replaces this method's implementation with `imp`, returning the previous `IMP`
     /// (`method_setImplementation`).
-    pub fn setImplementation(self: Method, imp: c.IMP) c.IMP {
+    pub inline fn setImplementation(self: Method, imp: c.IMP) c.IMP {
         return c.method_setImplementation(self.value, imp);
     }
 
     /// Atomically swaps the implementations of `m1` and `m2`
     /// (`method_exchangeImplementations`).
-    pub fn exchangeImplementations(m1: Method, m2: Method) void {
+    pub inline fn exchangeImplementations(m1: Method, m2: Method) void {
         c.method_exchangeImplementations(m1.value, m2.value);
     }
 
@@ -95,16 +96,16 @@ pub const Method = extern struct {
     /// structs at offset 0), Apple does not provide `method_invoke_fpret`, so this invokes
     /// `self.getImplementation()` directly with `(receiver, self.getName().value, ...)` to
     /// preserve the x87 `%st(0)` return.
-    pub fn invoke(
+    pub inline fn invoke(
         self: Method,
         target: anytype,
         comptime Return: type,
         args: anytype,
     ) Return {
-        const RealReturn = unwrapType(Return);
+        @setEvalBranchQuota(100_000);
+        const RealReturn = abi.UnwrapReturnType(Return, true);
         const target_val = unwrapTarget(target);
         const Target = @TypeOf(target_val);
-        const unwrapped_args = buildUnwrappedArgs(args);
 
         if (comptime cpkg.usesFpret(RealReturn)) {
             if (comptime (@typeInfo(Target) == .optional or (@typeInfo(Target) == .pointer and @typeInfo(Target).pointer.size == .c))) {
@@ -113,15 +114,17 @@ pub const Method = extern struct {
             const ImpFn = InvokeFn(RealReturn, Target, c.SEL, @TypeOf(args));
             const imp = self.getImplementation() orelse unreachable;
             const imp_ptr: *const ImpFn = @ptrCast(@alignCast(imp));
-            const result = @call(.auto, imp_ptr, .{ target_val, self.getName().value } ++ unwrapped_args);
-            return wrapReturn(Return, result);
+            const call_args = abi.buildCallArgs(.{ target_val, self.getName().value }, args, true);
+            const result = @call(.auto, imp_ptr, call_args);
+            return abi.wrapReturn(Return, result, true);
         }
 
         const Fn = InvokeFn(RealReturn, Target, c.Method, @TypeOf(args));
         const invoke_fn = comptime methodInvokePtr(RealReturn);
         const invoke_ptr: *const Fn = @ptrCast(@alignCast(invoke_fn));
-        const result = @call(.auto, invoke_ptr, .{ target_val, self.value } ++ unwrapped_args);
-        return wrapReturn(Return, result);
+        const call_args = abi.buildCallArgs(.{ target_val, self.value }, args, true);
+        const result = @call(.auto, invoke_ptr, call_args);
+        return abi.wrapReturn(Return, result, true);
     }
 
     comptime {
@@ -190,33 +193,19 @@ fn TargetAbiType(comptime T: type) type {
     };
 }
 
-fn unwrapTarget(target: anytype) TargetAbiType(@TypeOf(target)) {
-    const T = @TypeOf(target);
-    if (comptime @typeInfo(T) == .@"struct") {
-        return unwrapTarget(target.value);
-    }
-    return target;
-}
-
-fn WrapperUnderlying(comptime T: type) ?type {
-    return switch (T) {
-        objc.Object => c.id,
-        objc.Class => c.Class,
-        objc.Protocol => *c.Protocol,
-        objc.Sel => c.SEL,
-        objc.Property => c.objc_property_t,
-        objc.Ivar => c.Ivar,
-        Method => c.Method,
-        else => null,
+fn TargetUnwrapper(comptime T: type) type {
+    return struct {
+        inline fn unwrap(target: T) TargetAbiType(T) {
+            if (comptime @typeInfo(T) == .@"struct") {
+                return TargetUnwrapper(@TypeOf(target.value)).unwrap(target.value);
+            }
+            return target;
+        }
     };
 }
 
-fn NullablePtr(comptime V: type) type {
-    return switch (@typeInfo(V)) {
-        .optional => V,
-        .pointer => |p| if (p.size == .c) V else ?V,
-        else => unreachable,
-    };
+inline fn unwrapTarget(target: anytype) TargetAbiType(@TypeOf(target)) {
+    return TargetUnwrapper(@TypeOf(target)).unwrap(target);
 }
 
 fn InvokeFn(
@@ -236,94 +225,15 @@ fn InvokeFn(
     param_types[0] = Target;
     param_types[1] = SecondParam;
     for (args_info.field_types, 0..) |field_type, i| {
-        param_types[i + 2] = unwrapType(field_type);
+        param_types[i + 2] = abi.UnwrapParamType(field_type, true);
     }
 
     return @Fn(&param_types, &@splat(.{}), Return, .{ .@"callconv" = .c });
 }
 
-fn UnwrappedArgs(comptime Args: type) type {
-    if (@typeInfo(Args) != .@"struct" or !@typeInfo(Args).@"struct".is_tuple) {
-        @compileError("Method.invoke: args must be a tuple, got " ++ @typeName(Args));
-    }
-    const field_types = @typeInfo(Args).@"struct".field_types;
-    var types: [field_types.len]type = undefined;
-    for (field_types, 0..) |field_type, i| types[i] = unwrapType(field_type);
-    return @Tuple(&types);
-}
-
-fn unwrapType(comptime T: type) type {
-    if (T == bool) return c.BOOL;
-
-    if (WrapperUnderlying(T)) |V| return V;
-
-    switch (@typeInfo(T)) {
-        .int, .float, .void, .@"enum", .vector => {},
-        .pointer => |p| {
-            if (p.size == .slice)
-                @compileError("Method.invoke: " ++ @typeName(T) ++ " — Zig slices are not C-ABI compatible");
-        },
-        .optional => |opt| {
-            if (WrapperUnderlying(opt.child)) |V| return NullablePtr(V);
-            if (@typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice)
-                @compileError("Method.invoke: " ++ @typeName(T) ++ " — optional must wrap a pointer or objc wrapper");
-        },
-        .@"struct" => |s| {
-            if (s.layout != .@"extern" and s.layout != .@"packed")
-                @compileError("Method.invoke: " ++ @typeName(T) ++ " — struct must be extern or packed");
-            if (s.layout == .@"packed" and @bitSizeOf(T) > 128)
-                @compileError("Method.invoke: " ++ @typeName(T) ++ " — packed struct larger than 128 bits is not C-ABI compatible");
-        },
-        .@"union" => |u| {
-            if (u.layout != .@"extern")
-                @compileError("Method.invoke: " ++ @typeName(T) ++ " — union must be extern");
-        },
-        else => @compileError("Method.invoke: " ++ @typeName(T) ++ " — not C-ABI compatible"),
-    }
-
-    return T;
-}
-
-inline fn unwrapArg(arg: anytype) unwrapType(@TypeOf(arg)) {
-    const T = @TypeOf(arg);
-    if (T == bool) return cpkg.boolParam(arg);
-    if (comptime WrapperUnderlying(T) != null) return arg.value;
-    if (comptime @typeInfo(T) == .optional) {
-        const Child = @typeInfo(T).optional.child;
-        if (comptime WrapperUnderlying(Child) != null) {
-            return if (arg) |unwrapped| unwrapped.value else null;
-        }
-    }
-    return arg;
-}
-
-inline fn wrapReturn(comptime Return: type, raw: unwrapType(Return)) Return {
-    if (Return == bool) return cpkg.boolResult(raw);
-    if (comptime WrapperUnderlying(Return) != null) return Return{ .value = raw };
-    if (comptime @typeInfo(Return) == .optional) {
-        const Child = @typeInfo(Return).optional.child;
-        if (comptime WrapperUnderlying(Child)) |V| {
-            if (comptime @typeInfo(V) == .optional or (@typeInfo(V) == .pointer and @typeInfo(V).pointer.size == .c)) {
-                return if (raw == null) null else Child{ .value = raw };
-            } else {
-                return if (raw) |ptr| Child{ .value = ptr } else null;
-            }
-        }
-    }
-    return raw;
-}
-
-inline fn buildUnwrappedArgs(args: anytype) UnwrappedArgs(@TypeOf(args)) {
-    const field_types = @typeInfo(@TypeOf(args)).@"struct".field_types;
-    var result: UnwrappedArgs(@TypeOf(args)) = undefined;
-    inline for (field_types, 0..) |_, i| {
-        result[i] = unwrapArg(args[i]);
-    }
-    return result;
-}
-
 test "Method ABI layout and InvokeFn signatures" {
     const testing = std.testing;
+    const Ref = objc.BlockRef(.{i32}, i32);
 
     try testing.expectEqual(@sizeOf(c.Method), @sizeOf(Method));
     try testing.expectEqual(@alignOf(c.Method), @alignOf(Method));
@@ -340,12 +250,19 @@ test "Method ABI layout and InvokeFn signatures" {
     );
     try testing.expectEqual(
         fn (c.id, c.Method, c.BOOL, c.id, c.Class, ?*c.Protocol, c.SEL) callconv(.c) c.BOOL,
-        InvokeFn(unwrapType(bool), c.id, c.Method, @TypeOf(.{
+        InvokeFn(abi.UnwrapReturnType(bool, true), c.id, c.Method, @TypeOf(.{
             true,
             @as(?objc.Object, null),
             @as(?objc.Class, null),
             @as(?objc.Protocol, null),
             @as(?objc.Sel, null),
+        })),
+    );
+    try testing.expectEqual(
+        fn (c.id, c.Method, *anyopaque, ?*anyopaque) callconv(.c) ?*anyopaque,
+        InvokeFn(abi.UnwrapReturnType(?Ref, true), c.id, c.Method, @TypeOf(.{
+            @as(Ref, undefined),
+            @as(?Ref, null),
         })),
     );
 
@@ -752,4 +669,140 @@ test "Method.invoke with unaligned structs, packed structs, and long-double stru
     const m_ld_wrap = Cls.getInstanceMethod(objc.sel("makeLongDoubleWrap:")).?;
     const got_ld = m_ld_wrap.invoke(inst, LongDoubleWrap, .{@as(c_longdouble, 3.0)});
     try testing.expectApproxEqAbs(@as(f64, 7.5), @as(f64, @floatCast(got_ld.x)), 1e-12);
+}
+
+const TestNSPoint = extern struct { x: f64, y: f64 };
+const TestNSSize = extern struct { width: f64, height: f64 };
+const TestNSRect = extern struct { origin: TestNSPoint, size: TestNSSize };
+
+test "Method.invoke with ?BlockRef (non-null and null), NSRect (stret), and Object returns" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSObject = objc.getClass("NSObject").?;
+    const NSString = objc.getClass("NSString").?;
+    const NSNumber = objc.getClass("NSNumber").?;
+    const NSSortDescriptor = objc.getClass("NSSortDescriptor").?;
+
+    // 1. Foundation ?BlockRef return via Method.invoke (`-[NSSortDescriptor comparator]`)
+    const ComparatorRef = objc.BlockRef(.{ objc.Object, objc.Object }, objc.NSInteger);
+    const self_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"self"});
+
+    const sel_sort = NSSortDescriptor.msgSend(
+        objc.Object,
+        "sortDescriptorWithKey:ascending:",
+        .{ self_key, true },
+    );
+    const m_sel_cmp = sel_sort.getClass().?.getInstanceMethod(objc.Sel.cached("comparator")).?;
+    try testing.expect(m_sel_cmp.invoke(sel_sort, ?ComparatorRef, .{}) == null);
+
+    const CmpBlock = objc.Block(struct {}, .{ objc.Object, objc.Object }, objc.NSInteger);
+    const global_cmp = CmpBlock.initGlobal(&(struct {
+        fn cmp(_: *const CmpBlock.Context, a: c.id, b: c.id) callconv(.c) objc.NSInteger {
+            return objc.Object.fromId(a).msgSend(objc.NSInteger, "compare:", .{objc.Object.fromId(b)});
+        }
+    }).cmp);
+
+    const m_make_block_sort = NSSortDescriptor.getClassMethod(
+        objc.Sel.cached("sortDescriptorWithKey:ascending:comparator:"),
+    ).?;
+    const block_sort = m_make_block_sort.invoke(
+        NSSortDescriptor,
+        objc.Object,
+        .{ self_key, true, @as(?ComparatorRef, CmpBlock.asBlockRef(global_cmp)) },
+    );
+    const m_blk_cmp = block_sort.getClass().?.getInstanceMethod(objc.Sel.cached("comparator")).?;
+    const got_opt_cmp = m_blk_cmp.invoke(block_sort, ?ComparatorRef, .{}).?;
+    const got_cmp = m_blk_cmp.invoke(block_sort, ComparatorRef, .{});
+    try testing.expectEqual(got_cmp.value, got_opt_cmp.value);
+
+    const n1 = NSNumber.msgSend(objc.Object, "numberWithInt:", .{@as(c_int, 1)});
+    const n2 = NSNumber.msgSend(objc.Object, "numberWithInt:", .{@as(c_int, 2)});
+    try testing.expectEqual(@as(objc.NSInteger, -1), got_opt_cmp.invoke(.{ n1, n2 }));
+
+    // 2. Dynamic class combining ?BlockRef (non-null & null), NSRect (32-byte stret on x86_64), and Object returns
+    {
+        const NSRect = TestNSRect;
+
+        const RectBlock = objc.Block(struct { scale: f64 }, .{NSRect}, NSRect);
+        const RectRef = RectBlock.Ref;
+        const LabelBlock = objc.Block(struct { prefix: objc.Object }, .{i64}, objc.Object);
+        const LabelRef = LabelBlock.Ref;
+
+        const Cls = objc.allocateClassPair(NSObject, "ZigObjcMethodBlockAndRect").?;
+        defer objc.disposeClassPair(Cls);
+
+        const impls = struct {
+            fn transformRect(_: c.id, _: c.SEL, rect: NSRect, maybe_blk: ?*anyopaque) callconv(.c) NSRect {
+                if (RectRef.fromPtr(maybe_blk)) |blk| {
+                    return blk.invoke(.{rect});
+                }
+                return rect;
+            }
+            fn labelForValue(_: c.id, _: c.SEL, val: i64, maybe_blk: ?*anyopaque) callconv(.c) c.id {
+                if (LabelRef.fromPtr(maybe_blk)) |blk| {
+                    return blk.invoke(.{val}).value;
+                }
+                return objc.getClass("NSString").?.msgSend(objc.Object, "stringWithUTF8String:", .{"none"}).value;
+            }
+        };
+
+        try testing.expect(Cls.addMethod("transformRect:withBlock:", impls.transformRect));
+        try testing.expect(Cls.addMethod("labelForValue:withBlock:", impls.labelForValue));
+        objc.registerClassPair(Cls);
+
+        const inst = objc.allocInit(Cls).?;
+        defer inst.release();
+
+        const m_transform = Cls.getInstanceMethod(objc.sel("transformRect:withBlock:")).?;
+        const m_label = Cls.getInstanceMethod(objc.sel("labelForValue:withBlock:")).?;
+
+        const base_rect: NSRect = .{
+            .origin = .{ .x = 2.0, .y = 4.0 },
+            .size = .{ .width = 10.0, .height = 20.0 },
+        };
+
+        // Null ?BlockRef preserves base_rect via stret Method.invoke
+        const unchanged = m_transform.invoke(inst, NSRect, .{ base_rect, @as(?RectRef, null) });
+        try testing.expectEqual(base_rect, unchanged);
+
+        // Non-null ?BlockRef scales rect via stret Method.invoke
+        var rect_blk = RectBlock.init(.{ .scale = 2.5 }, &(struct {
+            fn run(ctx: *const RectBlock.Context, r: NSRect) callconv(.c) NSRect {
+                return .{
+                    .origin = .{ .x = r.origin.x * ctx.scale, .y = r.origin.y * ctx.scale },
+                    .size = .{ .width = r.size.width * ctx.scale, .height = r.size.height * ctx.scale },
+                };
+            }
+        }).run);
+        const scaled = m_transform.invoke(inst, NSRect, .{ base_rect, @as(?RectRef, RectBlock.asBlockRef(&rect_blk)) });
+        try testing.expectEqual(
+            NSRect{
+                .origin = .{ .x = 5.0, .y = 10.0 },
+                .size = .{ .width = 25.0, .height = 50.0 },
+            },
+            scaled,
+        );
+
+        // Null and non-null ?BlockRef returning objc.Object via Method.invoke
+        const default_label = m_label.invoke(inst, objc.Object, .{ @as(i64, 7), @as(?LabelRef, null) });
+        try testing.expectEqualStrings("none", std.mem.span(default_label.msgSend([*:0]const u8, "UTF8String", .{})));
+
+        const prefix = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"val="});
+        var label_blk = LabelBlock.init(.{ .prefix = prefix }, &(struct {
+            fn run(ctx: *const LabelBlock.Context, v: i64) callconv(.c) c.id {
+                const NSNumberCls = objc.getClass("NSNumber").?;
+                const num = NSNumberCls.msgSend(objc.Object, "numberWithLongLong:", .{@as(c_longlong, v)});
+                const num_str = num.msgSend(objc.Object, "stringValue", .{});
+                return LabelBlock.getCaptures(ctx).prefix.msgSend(objc.Object, "stringByAppendingString:", .{num_str}).value;
+            }
+        }).run);
+        const custom_label = m_label.invoke(
+            inst,
+            objc.Object,
+            .{ @as(i64, 42), @as(?LabelRef, LabelBlock.asBlockRef(&label_blk)) },
+        );
+        try testing.expectEqualStrings("val=42", std.mem.span(custom_label.msgSend([*:0]const u8, "UTF8String", .{})));
+    }
 }
