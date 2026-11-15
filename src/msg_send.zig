@@ -1,8 +1,26 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
-const c = @import("c.zig").c;
+const cpkg = @import("c.zig");
+const c = cpkg.c;
 const objc = @import("main.zig");
+
+/// Entry point for the Objective-C runtime's message forwarding machinery.
+/// Can be installed as a method `IMP` or compared against `class_getMethodImplementation`.
+pub const msgForward: c.IMP = @ptrCast(&c._objc_msgForward);
+
+/// Structure-returning message forwarding entry point on architectures that use
+/// separate `stret` dispatch (`x86_64`). `null` on `aarch64` where `_objc_msgForward_stret`
+/// is unavailable in the ABI.
+pub const msgForwardStret: c.IMP = if (builtin.target.cpu.arch != .aarch64 and @hasDecl(c, "_objc_msgForward_stret"))
+    @ptrCast(&c._objc_msgForward_stret)
+else
+    null;
+
+/// Sets custom handlers invoked by `_objc_msgForward` and `_objc_msgForward_stret`.
+pub fn setForwardHandler(fwd: *anyopaque, fwd_stret: *anyopaque) void {
+    c.objc_setForwardHandler(fwd, fwd_stret);
+}
 
 /// Returns a struct that implements the msgSend function for type T.
 pub fn MsgSend(comptime T: type) type {
@@ -18,13 +36,7 @@ pub fn MsgSend(comptime T: type) type {
             sel_raw: anytype,
             args: anytype,
         ) Return {
-            // Our one special-case: If the return type is our own Object
-            // type then we wrap it.
-            const is_object = Return == objc.Object;
-
-            // Our actual return value is an "id" if we are using one of
-            // our built-in types (see above). Otherwise, we trust the caller.
-            const RealReturn = if (is_object) c.id else Return;
+            const RealReturn = unwrapType(Return);
 
             // We accept multiple types for sel but we need to turn it into
             // an objc.sel ultimately.
@@ -38,12 +50,10 @@ pub fn MsgSend(comptime T: type) type {
             const msg_send_fn = comptime msgSendPtr(RealReturn, false);
             const msg_send_ptr: *const Fn = @ptrCast(@alignCast(msg_send_fn));
 
-            // Unwrap any Object types in args to their underlying c.id
             const unwrapped_args = buildUnwrappedArgs(args);
             const result = @call(.auto, msg_send_ptr, .{ target.value, sel.value } ++ unwrapped_args);
 
-            if (!is_object) return result;
-            return .{ .value = result };
+            return wrapReturn(Return, result);
         }
 
         /// Invoke a selector on the superclass.
@@ -54,10 +64,7 @@ pub fn MsgSend(comptime T: type) type {
             sel_raw: anytype,
             args: anytype,
         ) Return {
-            // See msgSend for in depth comments on all of this. This is
-            // effectively the same logic.
-            const is_object = Return == objc.Object;
-            const RealReturn = if (is_object) c.id else Return;
+            const RealReturn = unwrapType(Return);
             const sel: objc.Sel = switch (@TypeOf(sel_raw)) {
                 objc.Sel => sel_raw,
                 else => objc.sel(sel_raw),
@@ -78,35 +85,36 @@ pub fn MsgSend(comptime T: type) type {
                         .class = superclass.value,
                     };
 
-            // Unwrap any Object types in args to their underlying c.id
             const unwrapped_args = buildUnwrappedArgs(args);
             const result = @call(.auto, msg_send_ptr, .{ &super, sel.value } ++ unwrapped_args);
 
-            if (!is_object) return result;
-            return .{ .value = result };
+            return wrapReturn(Return, result);
         }
 
         /// Returns the objc_msgSend or objc_msgSendSuper pointer for the
-        /// given return type.
+        /// given C-ABI return type.
         fn msgSendPtr(
             comptime Return: type,
             comptime super: bool,
         ) *const fn () callconv(.c) void {
-            // See objc/message.h. The high-level is that depending on the
-            // target architecture and return type, we must use a different
-            // objc_msgSend function.
+            // See objc/message.h. Depending on the target architecture and
+            // return type, we must use the matching objc_msgSend entry point.
             return switch (builtin.target.cpu.arch) {
-                // Aarch64 uses objc_msgSend for everything. Hurray!
+                // AArch64 uses objc_msgSend / objc_msgSendSuper for all types.
                 .aarch64 => if (super) &c.objc_msgSendSuper else &c.objc_msgSend,
 
-                // x86_64 depends on the return type...
+                // x86_64 SysV ABI routing:
+                // - structs/unions > 16 bytes return on the stack via *_stret
+                // - 80-bit `long double` returns in x87 st(0) via objc_msgSend_fpret
+                //   (super calls still use objc_msgSendSuper; no Super_fpret exists)
+                // - `float` (f32) and `double` (f64 / CGFloat) return in xmm0 via objc_msgSend
                 .x86_64 => switch (@typeInfo(Return)) {
-                    // Most types use objc_msgSend
                     inline .int,
                     .bool,
                     .@"enum",
                     .pointer,
                     .void,
+                    .vector,
                     => if (super) &c.objc_msgSendSuper else &c.objc_msgSend,
 
                     .optional => |opt| opt: {
@@ -114,38 +122,16 @@ pub fn MsgSend(comptime T: type) type {
                         break :opt if (super) &c.objc_msgSendSuper else &c.objc_msgSend;
                     },
 
-                    // Structs must use objc_msgSend_stret.
-                    // NOTE: This is probably WAY more complicated... we only
-                    // call this if the struct is NOT returned as a register.
-                    // And that depends on the size of the struct. But I don't
-                    // know what the breakpoint actually is for that. This SO
-                    // answer says 16 bytes so I'm going to use that but I have
-                    // no idea...
-                    .@"struct" => blk: {
-                        if (@sizeOf(Return) > 16) {
-                            break :blk if (super)
-                                &c.objc_msgSendSuper_stret
-                            else
-                                &c.objc_msgSend_stret;
-                        } else {
-                            break :blk if (super)
-                                &c.objc_msgSendSuper
-                            else
-                                &c.objc_msgSend;
-                        }
-                    },
+                    .@"struct", .@"union" => if (@sizeOf(Return) > 16)
+                        (if (super) &c.objc_msgSendSuper_stret else &c.objc_msgSend_stret)
+                    else
+                        (if (super) &c.objc_msgSendSuper else &c.objc_msgSend),
 
-                    // Floats use objc_msgSend_fpret for f64 on x86_64,
-                    // but normal msgSend for other bit sizes. i386 has
-                    // more complex rules but we don't support i386 at the time
-                    // of this comment and probably never will since all i386
-                    // Apple models are discontinued at this point.
-                    .float => |float| switch (float.bits) {
-                        64 => if (super) &c.objc_msgSendSuper_fpret else &c.objc_msgSend_fpret,
-                        else => if (super) &c.objc_msgSendSuper else &c.objc_msgSend,
-                    },
+                    .float => |float| if (Return == c_longdouble or float.bits == 80)
+                        (if (super) &c.objc_msgSendSuper else &c.objc_msgSend_fpret)
+                    else
+                        (if (super) &c.objc_msgSendSuper else &c.objc_msgSend),
 
-                    // Otherwise we log in case we need to add a new case above
                     else => {
                         @compileLog(@typeInfo(Return));
                         @compileError("unsupported return type for objc runtime on x86_64");
@@ -158,30 +144,29 @@ pub fn MsgSend(comptime T: type) type {
     };
 }
 
-/// This returns a function body type for `obj_msgSend` that matches
+/// If `T` is an `objc` runtime handle wrapper (`Object`, `Class`, `Protocol`,
+/// `Sel`, or `Property`), returns its underlying C ABI pointer type.
+fn WrapperUnderlying(comptime T: type) ?type {
+    return switch (T) {
+        objc.Object => c.id,
+        objc.Class => c.Class,
+        objc.Protocol => *c.Protocol,
+        objc.Sel => c.SEL,
+        objc.Property => c.objc_property_t,
+        else => null,
+    };
+}
+
+fn NullablePtr(comptime V: type) type {
+    return switch (@typeInfo(V)) {
+        .optional => V,
+        .pointer => |p| if (p.size == .c) V else ?V,
+        else => unreachable,
+    };
+}
+
+/// This returns a function body type for `objc_msgSend` that matches
 /// the given return type, target type, and arguments tuple type.
-///
-/// obj_msgSend is a really interesting function, because it doesn't act
-/// like a typical function. You have to call it with the C ABI as if you're
-/// calling the true target function, not as a varargs C function. Therefore
-/// you have to cast obj_msgSend to a function pointer type of the final
-/// destination function, then call that.
-///
-/// Example: you have an ObjC function like this:
-///
-///     @implementation Foo
-///     - (void)log: (float)x { /* stuff */ }
-///
-/// If you call it like this, it won't work (you'll get garbage):
-///
-///     objc_msgSend(obj, @selector(log:), (float)PI);
-///
-/// You have to call it like this:
-///
-///     ((void (*)(id, SEL, float))objc_msgSend)(obj, @selector(log:), M_PI);
-///
-/// This comptime function returns the function body type that can be used
-/// to cast and call for the proper C ABI behavior.
 fn MsgSendFn(
     comptime Return: type,
     comptime Target: type,
@@ -210,35 +195,23 @@ fn UnwrappedArgs(comptime Args: type) type {
     return @Tuple(&types);
 }
 
-/// Maps objc wrapper types to their underlying C types for use in @Fn signatures,
-/// and validates that all other types are C-ABI compatible.
+/// Maps objc wrapper types and `bool` to their underlying C ABI types for use in `@Fn`
+/// signatures, and validates that all other types are C-ABI compatible.
 fn unwrapType(comptime T: type) type {
-    // Unwrap our objc.Object type
-    if (T == objc.Object) return c.id;
+    if (T == bool) return c.BOOL;
 
-    // Unwrap any other objc wrapper (Class, Sel, etc.) — identified by having
-    // a single 'value' field of pointer size. Return the actual field type
-    // rather than c.id, since Class and Sel have distinct pointer types.
-    if (@typeInfo(T) == .@"struct") {
-        const info = @typeInfo(T).@"struct";
-        for (info.field_names, info.field_types) |field_name, field_type| {
-            if (std.mem.eql(u8, field_name, "value") and @sizeOf(field_type) == @sizeOf(c.id)) {
-                return field_type;
-            }
-        }
-    }
+    if (WrapperUnderlying(T)) |V| return V;
 
-    // Validate that the remaining type is safe to pass over the C ABI.
-    // Previously (pre-0.16), passing a non-C-compatible type like []const u8
-    // would silently compile but segfault at runtime via objc_msgSend.
-    // These checks turn that into a compile error.
     switch (@typeInfo(T)) {
-        .int, .float, .bool, .void => {},
-        .@"enum" => {},
-        .pointer => {},
+        .int, .float, .void, .@"enum", .vector => {},
+        .pointer => |p| {
+            if (p.size == .slice)
+                @compileError("msgSend: " ++ @typeName(T) ++ " — Zig slices are not C-ABI compatible");
+        },
         .optional => |opt| {
-            if (@typeInfo(opt.child) != .pointer)
-                @compileError("msgSend: " ++ @typeName(T) ++ " — optional must wrap a pointer");
+            if (WrapperUnderlying(opt.child)) |V| return NullablePtr(V);
+            if (@typeInfo(opt.child) != .pointer or @typeInfo(opt.child).pointer.size == .slice)
+                @compileError("msgSend: " ++ @typeName(T) ++ " — optional must wrap a pointer or objc wrapper");
         },
         .@"struct" => |s| {
             if (s.layout != .@"extern" and s.layout != .@"packed")
@@ -254,19 +227,45 @@ fn unwrapType(comptime T: type) type {
     return T;
 }
 
+inline fn unwrapArg(arg: anytype) unwrapType(@TypeOf(arg)) {
+    const T = @TypeOf(arg);
+    if (T == bool) return cpkg.boolParam(arg);
+    if (comptime WrapperUnderlying(T) != null) return arg.value;
+    if (comptime @typeInfo(T) == .optional) {
+        const Child = @typeInfo(T).optional.child;
+        if (comptime WrapperUnderlying(Child) != null) {
+            return if (arg) |unwrapped| unwrapped.value else null;
+        }
+    }
+    return arg;
+}
+
+inline fn wrapReturn(comptime Return: type, raw: unwrapType(Return)) Return {
+    if (Return == bool) return cpkg.boolResult(raw);
+    if (comptime WrapperUnderlying(Return) != null) return Return{ .value = raw };
+    if (comptime @typeInfo(Return) == .optional) {
+        const Child = @typeInfo(Return).optional.child;
+        if (comptime WrapperUnderlying(Child)) |V| {
+            if (comptime @typeInfo(V) == .optional or (@typeInfo(V) == .pointer and @typeInfo(V).pointer.size == .c)) {
+                return if (raw == null) null else Child{ .value = raw };
+            } else {
+                return if (raw) |ptr| Child{ .value = ptr } else null;
+            }
+        }
+    }
+    return raw;
+}
+
 inline fn buildUnwrappedArgs(args: anytype) UnwrappedArgs(@TypeOf(args)) {
     const field_types = @typeInfo(@TypeOf(args)).@"struct".field_types;
     var result: UnwrappedArgs(@TypeOf(args)) = undefined;
     inline for (field_types, 0..) |_, i| {
-        result[i] = if (unwrapType(@TypeOf(args[i])) != @TypeOf(args[i]))
-            args[i].value
-        else
-            args[i];
+        result[i] = unwrapArg(args[i]);
     }
     return result;
 }
 
-test {
+test "MsgSendFn signatures" {
     const testing = std.testing;
     try testing.expectEqual(fn (
         c.id,
@@ -276,6 +275,35 @@ test {
         @as(u16, 0),
         @as(u32, 0),
     })));
+    try testing.expectEqual(
+        fn (c.id, c.SEL, c.BOOL, c.id, c.Class, ?*c.Protocol, c.SEL) callconv(.c) c.BOOL,
+        MsgSendFn(unwrapType(bool), c.id, @TypeOf(.{
+            true,
+            @as(?objc.Object, null),
+            @as(?objc.Class, null),
+            @as(?objc.Protocol, null),
+            @as(?objc.Sel, null),
+        })),
+    );
+
+    if (builtin.target.cpu.arch == .x86_64) {
+        const Sender = MsgSend(objc.Object);
+        const Small = extern struct { a: u64, b: u64 };
+        const Large = extern struct { a: u64, b: u64, d: u64 };
+        try testing.expectEqual(&c.objc_msgSend, Sender.msgSendPtr(f32, false));
+        try testing.expectEqual(&c.objc_msgSendSuper, Sender.msgSendPtr(f32, true));
+        try testing.expectEqual(&c.objc_msgSend, Sender.msgSendPtr(f64, false));
+        try testing.expectEqual(&c.objc_msgSendSuper, Sender.msgSendPtr(f64, true));
+        try testing.expectEqual(&c.objc_msgSend_fpret, Sender.msgSendPtr(c_longdouble, false));
+        try testing.expectEqual(&c.objc_msgSendSuper, Sender.msgSendPtr(c_longdouble, true));
+        try testing.expectEqual(&c.objc_msgSend, Sender.msgSendPtr(Small, false));
+        try testing.expectEqual(&c.objc_msgSendSuper, Sender.msgSendPtr(Small, true));
+        try testing.expectEqual(&c.objc_msgSend_stret, Sender.msgSendPtr(Large, false));
+        try testing.expectEqual(&c.objc_msgSendSuper_stret, Sender.msgSendPtr(Large, true));
+        try testing.expect(msgForwardStret != null);
+    } else if (builtin.target.cpu.arch == .aarch64) {
+        try testing.expect(msgForwardStret == null);
+    }
 }
 
 test "subClass" {
@@ -294,4 +322,175 @@ test "subClass" {
     const subclass_obj = Subclass.msgSend(objc.Object, "alloc", .{});
     defer subclass_obj.msgSend(void, "dealloc", .{});
     subclass_obj.msgSend(void, "init", .{});
+}
+
+test "msgSend f32, f64, and bool roundtrips" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSNumber = objc.getClass("NSNumber").?;
+
+    const num_f64 = NSNumber.msgSend(objc.Object, "numberWithDouble:", .{@as(f64, 3.141592653589793)});
+    try testing.expectApproxEqAbs(@as(f64, 3.141592653589793), num_f64.msgSend(f64, "doubleValue", .{}), 1e-12);
+
+    const num_f32 = NSNumber.msgSend(objc.Object, "numberWithFloat:", .{@as(f32, -42.5)});
+    try testing.expectApproxEqAbs(@as(f32, -42.5), num_f32.msgSend(f32, "floatValue", .{}), 1e-6);
+
+    const num_true = NSNumber.msgSend(objc.Object, "numberWithBool:", .{true});
+    try testing.expect(num_true.msgSend(bool, "boolValue", .{}));
+
+    const num_false = NSNumber.msgSend(objc.Object, "numberWithBool:", .{false});
+    try testing.expect(!num_false.msgSend(bool, "boolValue", .{}));
+}
+
+test "msgSend optional wrappers (?Object, ?Class, ?Protocol, ?Sel)" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSMutableDictionary = objc.getClass("NSMutableDictionary").?;
+    const NSString = objc.getClass("NSString").?;
+
+    const dict = NSMutableDictionary.msgSend(objc.Object, "dictionary", .{});
+    const key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"present"});
+    const missing = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"missing"});
+    const val = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"hello"});
+
+    try testing.expect(dict.msgSend(?objc.Object, "objectForKey:", .{missing}) == null);
+
+    dict.msgSend(void, "setObject:forKey:", .{ val, key });
+    const found = dict.msgSend(?objc.Object, "objectForKey:", .{key}) orelse return error.ExpectedObject;
+    try testing.expect(found.msgSend(bool, "isEqualToString:", .{val}));
+
+    // Real runtime root/subclass ?Class returns (`[NSObject superclass]` is nil)
+    const NSObject = objc.getClass("NSObject").?;
+    const NSMutableString = objc.getClass("NSMutableString").?;
+    try testing.expect(NSObject.msgSend(?objc.Class, "superclass", .{}) == null);
+    try testing.expectEqual(NSString.value, NSMutableString.msgSend(?objc.Class, "superclass", .{}).?.value);
+
+    // Dynamic class exercising ?Object, ?Class, ?Protocol, ?Sel arguments and returns.
+    const Helper = objc.allocateClassPair(NSObject, "ZigObjcOptionalWrapperTest").?;
+    defer objc.disposeClassPair(Helper);
+
+    const impls = struct {
+        fn echoObj(_: c.id, _: c.SEL, arg: c.id) callconv(.c) c.id {
+            return arg;
+        }
+        fn echoClass(_: c.id, _: c.SEL, arg: c.Class) callconv(.c) c.Class {
+            return arg;
+        }
+        fn echoProto(_: c.id, _: c.SEL, arg: ?*c.Protocol) callconv(.c) ?*c.Protocol {
+            return arg;
+        }
+        fn echoSel(_: c.id, _: c.SEL, arg: c.SEL) callconv(.c) c.SEL {
+            return arg;
+        }
+    };
+
+    try testing.expect(Helper.addMethod("echoObj:", impls.echoObj));
+    try testing.expect(Helper.addMethod("echoClass:", impls.echoClass));
+    try testing.expect(Helper.addMethod("echoProto:", impls.echoProto));
+    try testing.expect(Helper.addMethod("echoSel:", impls.echoSel));
+    objc.registerClassPair(Helper);
+
+    const inst = Helper.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "init", .{});
+    defer inst.msgSend(void, "release", .{});
+
+    try testing.expect(inst.msgSend(?objc.Object, "echoObj:", .{@as(?objc.Object, null)}) == null);
+    const echoed_obj = inst.msgSend(?objc.Object, "echoObj:", .{@as(?objc.Object, val)}).?;
+    try testing.expectEqual(val.value, echoed_obj.value);
+
+    try testing.expect(inst.msgSend(?objc.Class, "echoClass:", .{@as(?objc.Class, null)}) == null);
+    const echoed_cls = inst.msgSend(?objc.Class, "echoClass:", .{@as(?objc.Class, NSString)}).?;
+    try testing.expectEqual(NSString.value, echoed_cls.value);
+
+    const obj_proto = objc.getProtocol("NSObject").?;
+    try testing.expect(inst.msgSend(?objc.Protocol, "echoProto:", .{@as(?objc.Protocol, null)}) == null);
+    const echoed_proto = inst.msgSend(?objc.Protocol, "echoProto:", .{@as(?objc.Protocol, obj_proto)}).?;
+    try testing.expect(echoed_proto.isEqual(obj_proto));
+
+    const init_sel = objc.sel("init");
+    try testing.expect(inst.msgSend(?objc.Sel, "echoSel:", .{@as(?objc.Sel, null)}) == null);
+    const echoed_sel = inst.msgSend(?objc.Sel, "echoSel:", .{@as(?objc.Sel, init_sel)}).?;
+    try testing.expect(echoed_sel.isEqual(init_sel));
+}
+
+test "msgSend and msgSendSuper struct returns (<= 16 bytes and > 16 bytes)" {
+    const testing = std.testing;
+    const NSObject = objc.getClass("NSObject").?;
+
+    const SmallPair = extern struct { a: u64, b: u64 };
+    const LargeRect = extern struct { x: f64, y: f64, w: f64, h: f64 };
+
+    const Base = objc.allocateClassPair(NSObject, "ZigObjcStructBase").?;
+    defer objc.disposeClassPair(Base);
+
+    const base_impls = struct {
+        fn getSmall(_: c.id, _: c.SEL) callconv(.c) SmallPair {
+            return .{ .a = 11, .b = 22 };
+        }
+        fn getLarge(_: c.id, _: c.SEL) callconv(.c) LargeRect {
+            return .{ .x = 1.0, .y = 2.0, .w = 30.0, .h = 40.0 };
+        }
+    };
+    try testing.expect(Base.addMethod("getSmall", base_impls.getSmall));
+    try testing.expect(Base.addMethod("getLarge", base_impls.getLarge));
+    objc.registerClassPair(Base);
+
+    const Sub = objc.allocateClassPair(Base, "ZigObjcStructSub").?;
+    defer objc.disposeClassPair(Sub);
+
+    const sub_impls = struct {
+        fn getLarge(target: c.id, _: c.SEL) callconv(.c) LargeRect {
+            const self = objc.Object.fromId(target);
+            const sup = self.msgSendSuper(objc.getClass("ZigObjcStructBase").?, LargeRect, "getLarge", .{});
+            return .{ .x = sup.x + 10.0, .y = sup.y + 20.0, .w = sup.w * 2.0, .h = sup.h * 2.0 };
+        }
+    };
+    try testing.expect(Sub.addMethod("getLarge", sub_impls.getLarge));
+    objc.registerClassPair(Sub);
+
+    const sub = Sub.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "init", .{});
+    defer sub.msgSend(void, "release", .{});
+
+    const small = sub.msgSend(SmallPair, "getSmall", .{});
+    try testing.expectEqual(SmallPair{ .a = 11, .b = 22 }, small);
+
+    const large = sub.msgSend(LargeRect, "getLarge", .{});
+    try testing.expectEqual(LargeRect{ .x = 11.0, .y = 22.0, .w = 60.0, .h = 80.0 }, large);
+}
+
+test "msgForward" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    try testing.expect(msgForward != null);
+
+    const NSObject = objc.getClass("NSObject").?;
+    const missing_imp = c.class_getMethodImplementation(NSObject.value, objc.sel("zigObjcDefinitelyMissingSelector").value);
+    try testing.expectEqual(msgForward, missing_imp);
+
+    // Build a lightweight proxy class whose `length` IMP is `msgForward` and
+    // which forwards unrecognized selectors to an inner NSString via
+    // `forwardingTargetForSelector:`.
+    const Proxy = objc.allocateClassPair(NSObject, "ZigObjcForwardProxy").?;
+    defer objc.disposeClassPair(Proxy);
+
+    const proxy_impls = struct {
+        fn forwardingTarget(_: c.id, _: c.SEL, _: c.SEL) callconv(.c) c.id {
+            const NSString = objc.getClass("NSString").?;
+            return NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"forwarded!"}).value;
+        }
+    };
+    try testing.expect(Proxy.addMethod("forwardingTargetForSelector:", proxy_impls.forwardingTarget));
+    try testing.expect(cpkg.boolResult(c.class_addMethod(Proxy.value, objc.sel("length").value, msgForward, "Q@:")));
+    objc.registerClassPair(Proxy);
+
+    const proxy = Proxy.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "init", .{});
+    defer proxy.msgSend(void, "release", .{});
+
+    const len = proxy.msgSend(objc.NSUInteger, "length", .{});
+    try testing.expectEqual(@as(objc.NSUInteger, 10), len);
 }

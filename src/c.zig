@@ -1,11 +1,14 @@
 pub const c = @import("objc-c");
 
+pub const NSInteger = isize;
+pub const NSUInteger = usize;
+
 /// On some targets, Objective-C uses `i8` instead of `bool`.
 /// This helper casts a target value type to `bool`.
 pub fn boolResult(result: c.BOOL) bool {
     return switch (c.BOOL) {
         bool => result,
-        i8 => result == 1,
+        i8 => result != 0,
         else => @compileError("unexpected boolean type"),
     };
 }
