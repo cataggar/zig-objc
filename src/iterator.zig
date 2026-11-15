@@ -41,6 +41,10 @@ pub const Iterator = struct {
         if (self.batch_index >= self.batch_len) {
             if (self.exhausted) return null;
 
+            if (self.mutations_self_offset != no_self_offset) {
+                self.state.mutationsPtr = @ptrFromInt(@intFromPtr(&self.state) + self.mutations_self_offset);
+            }
+
             const count = self.object.msgSend(c_ulong, self.sel, .{
                 &self.state,
                 &self.buffer,
@@ -329,4 +333,97 @@ test "moving an active NSDictionary Iterator across stack frames remains valid" 
     }
     try testing.expectEqual(total, count);
     try testing.expectEqual(expected_sum, sum);
+}
+
+test "moving an active multi-batch Iterator whose mutationsPtr aliases state.extra survives refill" {
+    const testing = std.testing;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    // Custom NSFastEnumeration class that mirrors immutable Foundation collections:
+    // - sets `state.mutationsPtr = &state.extra[0]` ONLY on batch 0 (`state.state == 0`)
+    // - leaves `state.mutationsPtr` untouched on subsequent refills (`state.state > 0`)
+    // - populates `buffer` (internal 16-item buffer) across multiple batches (35 items total)
+    const NSObject = objc.getClass("NSObject").?;
+    const NSNumber = objc.getClass("NSNumber").?;
+
+    const CustomSeq = objc.allocateClassPair(NSObject, "ZigObjcRelocatableMultiBatchSeq") orelse return error.AllocateFailed;
+    defer objc.disposeClassPair(CustomSeq);
+
+    const Impls = struct {
+        const total_items: usize = 35;
+
+        fn countByEnumerating(
+            _: objc.Object,
+            _: objc.Sel,
+            state: *NSFastEnumerationState,
+            stackbuf: [*]objc.c.id,
+            len: c_ulong,
+        ) callconv(.c) c_ulong {
+            const idx: usize = @intCast(state.state);
+            if (idx >= total_items) return 0;
+
+            if (idx == 0) {
+                state.extra[0] = 0x1234_5678;
+                state.mutationsPtr = @ptrCast(&state.extra[0]);
+            }
+            // Intentionally do NOT touch `state.mutationsPtr` on `idx > 0`!
+            const batch = @min(total_items - idx, @as(usize, @intCast(len)));
+            const num_cls = objc.Class.cached("NSNumber").?;
+            for (0..batch) |i| {
+                const v: c_int = @intCast(idx + i + 1);
+                stackbuf[i] = num_cls.msgSend(objc.Object, "numberWithInt:", .{v}).value;
+            }
+            state.itemsPtr = stackbuf;
+            state.state = @intCast(idx + batch);
+            return @intCast(batch);
+        }
+    };
+
+    try testing.expect(CustomSeq.addMethod(
+        "countByEnumeratingWithState:objects:count:",
+        Impls.countByEnumerating,
+    ));
+    objc.registerClassPair(CustomSeq);
+
+    const seq = objc.allocInit(CustomSeq) orelse return error.AllocInitFailed;
+    defer seq.release();
+    _ = NSNumber;
+
+    const Helpers = struct {
+        const Started = struct {
+            iter: Iterator,
+            first_val: c_int,
+        };
+
+        noinline fn startAndConsumeOne(s: objc.Object) Started {
+            var it = s.iterate();
+            const first = it.next().?;
+            return .{
+                .iter = it,
+                .first_val = first.getProperty(c_int, "intValue"),
+            };
+        }
+
+        noinline fn clobberStackFrame() void {
+            var poison: [128]usize = @splat(0xDEAD_BEEF_CAFE_BABE);
+            std.mem.doNotOptimizeAway(&poison);
+        }
+    };
+
+    const started = Helpers.startAndConsumeOne(seq);
+    Helpers.clobberStackFrame();
+
+    var moved_iter = started.iter;
+    try testing.expect(moved_iter.uses_internal_buffer);
+    try testing.expect(moved_iter.mutations_self_offset != Iterator.no_self_offset);
+
+    var count: usize = 1;
+    var sum: c_int = started.first_val;
+    while (moved_iter.next()) |item| {
+        sum += item.getProperty(c_int, "intValue");
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, 35), count);
+    try testing.expectEqual(@as(c_int, 35 * 36 / 2), sum);
 }

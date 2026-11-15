@@ -402,11 +402,21 @@ fn validateAddIvarNestedElement(comptime T: type, comptime seen: []const type) v
             {
                 @compileError("Class.addIvar cannot store 16-byte Zig optional struct " ++ @typeName(T) ++ " inside a pointer/array/aggregate; use objc.Object, objc.Class, *objc.Object, or ?*MyZigState instead");
             }
-            validateAddIvarNestedElement(@typeInfo(opt.child).pointer.child, seen);
+            if (@sizeOf(T) == 0) {
+                @compileError("Class.addIvar cannot store zero-sized optional pointer " ++ @typeName(T) ++ "; use ?*anyopaque");
+            }
+            const child = @typeInfo(opt.child).pointer.child;
+            for (seen) |prev| {
+                if (prev == child) return;
+            }
+            validateAddIvarNestedElement(child, seen ++ &[_]type{child});
         },
         .pointer => |ptr| {
             if (ptr.size == .slice) {
                 @compileError("Class.addIvar does not support Zig slices (" ++ @typeName(T) ++ "); store a pointer and length or ?*MyZigState instead");
+            }
+            if (@sizeOf(T) == 0) {
+                @compileError("Class.addIvar cannot store zero-sized pointer " ++ @typeName(T) ++ "; use *anyopaque");
             }
             for (seen) |prev| {
                 if (prev == ptr.child) return;
@@ -424,15 +434,23 @@ fn validateAddIvarNestedElement(comptime T: type, comptime seen: []const type) v
         },
         .@"struct" => |s| {
             if (s.layout == .@"extern") {
+                for (seen) |prev| {
+                    if (prev == T) return;
+                }
+                const next_seen = seen ++ &[_]type{T};
                 for (s.field_types) |FieldType| {
-                    validateAddIvarNestedElement(FieldType, seen);
+                    validateAddIvarNestedElement(FieldType, next_seen);
                 }
             }
         },
         .@"union" => |u| {
             if (u.layout == .@"extern") {
+                for (seen) |prev| {
+                    if (prev == T) return;
+                }
+                const next_seen = seen ++ &[_]type{T};
                 for (u.field_types) |FieldType| {
-                    validateAddIvarNestedElement(FieldType, seen);
+                    validateAddIvarNestedElement(FieldType, next_seen);
                 }
             }
         },
@@ -450,11 +468,18 @@ fn validateAddIvarType(comptime T: type) void {
             {
                 @compileError("Class.addIvar cannot use 16-byte Zig optional struct " ++ @typeName(T) ++ " for an 8-byte Objective-C ivar; use objc.Object, objc.Class, objc.Sel, objc.c.id, or ?*MyZigState instead");
             }
-            validateAddIvarNestedElement(@typeInfo(opt.child).pointer.child, &.{});
+            if (@sizeOf(T) == 0) {
+                @compileError("Class.addIvar cannot store zero-sized optional pointer " ++ @typeName(T) ++ "; use ?*anyopaque");
+            }
+            const child = @typeInfo(opt.child).pointer.child;
+            validateAddIvarNestedElement(child, &.{child});
         },
         .pointer => |ptr| {
             if (ptr.size == .slice) {
                 @compileError("Class.addIvar does not support Zig slices (" ++ @typeName(T) ++ "); store a pointer and length or *MyZigState instead");
+            }
+            if (@sizeOf(T) == 0) {
+                @compileError("Class.addIvar cannot store zero-sized pointer " ++ @typeName(T) ++ "; use *anyopaque");
             }
             validateAddIvarNestedElement(ptr.child, &.{ptr.child});
         },
@@ -1327,6 +1352,53 @@ test "addMethod and replaceMethod with direct objc.Object and objc.Sel IMPs" {
     const tag_val = inst.msgSend(isize, "directTag", .{});
     try testing.expect(State.replace_cmd_matched);
     try testing.expectEqual(@as(isize, 107), tag_val);
+}
+
+test "Class.addIvar and IvarSlot with self-referential ?*Node and opaque *ZigStruct" {
+    const testing = std.testing;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const Node = extern struct {
+        next: ?*@This(),
+        val: i32,
+        _pad: i32 = 0,
+    };
+    const ZigAppState = struct {
+        title: []const u8,
+        weak: objc.Weak,
+    };
+
+    const NSObject = Class.cached("NSObject") orelse return error.ClassNotFound;
+    const cls = allocateClassPair(NSObject, "ZigObjcSelfRefIvarClass") orelse return error.AllocateClassFailed;
+    defer disposeClassPair(cls);
+
+    try testing.expect(cls.addIvar(Node, "inline_node"));
+    try testing.expect(cls.addIvar(?*Node, "head_ptr"));
+    try testing.expect(cls.addIvar(?*ZigAppState, "app_state"));
+    registerClassPair(cls);
+
+    const inst = objc.allocInit(cls) orelse return error.AllocInitFailed;
+    defer inst.release();
+
+    const node_slot = objc.IvarSlot(Node).fromClass(cls, "inline_node") orelse return error.SlotMissing;
+    const head_slot = objc.IvarSlot(?*Node).fromClass(cls, "head_ptr") orelse return error.SlotMissing;
+    const state_slot = objc.IvarSlot(?*ZigAppState).fromClass(cls, "app_state") orelse return error.SlotMissing;
+
+    var tail: Node = .{ .next = null, .val = 99 };
+    node_slot.store(inst, .{ .next = &tail, .val = 11 });
+    head_slot.store(inst, &tail);
+
+    var app_state: ZigAppState = .{ .title = "hardened", .weak = .{} };
+    app_state.weak.init(null);
+    defer app_state.weak.deinit();
+    state_slot.store(inst, &app_state);
+
+    const loaded_node = node_slot.load(inst);
+    try testing.expectEqual(@as(i32, 11), loaded_node.val);
+    try testing.expectEqual(@as(i32, 99), loaded_node.next.?.val);
+    try testing.expectEqual(&tail, head_slot.load(inst).?);
+    try testing.expectEqualStrings("hardened", state_slot.load(inst).?.title);
 }
 
 test {

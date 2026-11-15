@@ -46,11 +46,18 @@ pub fn validateDirectIvarType(comptime T: type) void {
             {
                 @compileError("ivar type " ++ @typeName(T) ++ " is a 16-byte Zig optional struct, not an 8-byte Objective-C handle; use the non-optional wrapper (e.g. objc.Class, objc.Sel, BlockRef) or ?*MyZigState instead");
             }
-            validateDirectIvarNestedElement(@typeInfo(opt.child).pointer.child, &.{});
+            if (@sizeOf(T) == 0) {
+                @compileError("direct ivar access cannot use zero-sized optional pointer " ++ @typeName(T) ++ "; use ?*anyopaque");
+            }
+            const child = @typeInfo(opt.child).pointer.child;
+            validateDirectIvarNestedElement(child, &.{child});
         },
         .pointer => |ptr| {
             if (ptr.size == .slice) {
                 @compileError("direct ivar access does not support Zig slices (" ++ @typeName(T) ++ "); store a pointer (*MyZigState) instead");
+            }
+            if (@sizeOf(T) == 0) {
+                @compileError("direct ivar access cannot use zero-sized pointer " ++ @typeName(T) ++ "; use *anyopaque");
             }
             validateDirectIvarNestedElement(ptr.child, &.{ptr.child});
         },
@@ -87,11 +94,21 @@ fn validateDirectIvarNestedElement(comptime T: type, comptime seen: []const type
             {
                 @compileError("ivar element " ++ @typeName(T) ++ " is a 16-byte Zig optional struct, not an 8-byte Objective-C pointer");
             }
-            validateDirectIvarNestedElement(@typeInfo(opt.child).pointer.child, seen);
+            if (@sizeOf(T) == 0) {
+                @compileError("ivar element cannot be zero-sized optional pointer " ++ @typeName(T));
+            }
+            const child = @typeInfo(opt.child).pointer.child;
+            for (seen) |prev| {
+                if (prev == child) return;
+            }
+            validateDirectIvarNestedElement(child, seen ++ &[_]type{child});
         },
         .pointer => |ptr| {
             if (ptr.size == .slice) {
                 @compileError("ivar element cannot be Zig slice " ++ @typeName(T));
+            }
+            if (@sizeOf(T) == 0) {
+                @compileError("ivar element cannot be zero-sized pointer " ++ @typeName(T));
             }
             for (seen) |prev| {
                 if (prev == ptr.child) return;
@@ -109,15 +126,23 @@ fn validateDirectIvarNestedElement(comptime T: type, comptime seen: []const type
         },
         .@"struct" => |s| {
             if (s.layout == .@"extern") {
+                for (seen) |prev| {
+                    if (prev == T) return;
+                }
+                const next_seen = seen ++ &[_]type{T};
                 for (s.field_types) |FieldType| {
-                    validateDirectIvarNestedElement(FieldType, seen);
+                    validateDirectIvarNestedElement(FieldType, next_seen);
                 }
             }
         },
         .@"union" => |u| {
             if (u.layout == .@"extern") {
+                for (seen) |prev| {
+                    if (prev == T) return;
+                }
+                const next_seen = seen ++ &[_]type{T};
                 for (u.field_types) |FieldType| {
-                    validateDirectIvarNestedElement(FieldType, seen);
+                    validateDirectIvarNestedElement(FieldType, next_seen);
                 }
             }
         },

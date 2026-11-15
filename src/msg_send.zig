@@ -1275,3 +1275,66 @@ test "idiomatic NSError** out-parameter pattern using *objc.Object" {
     try testing.expect(cocoa_err.value != null);
     try testing.expect(cocoa_err.msgSend(objc.NSInteger, "code", .{}) != 0);
 }
+
+test "msgSend with opaque Zig *Struct pointers and *Block.Context capturing *Weak" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const AppContext = struct {
+        tag: []const u8,
+        weak_ref: objc.Weak,
+        counter: usize,
+    };
+    const WeakActionBlock = objc.Block(struct { weak_ptr: *objc.Weak, delta: usize }, .{}, usize);
+
+    const NSObject = objc.getClass("NSObject").?;
+    const Bridge = objc.allocateClassPair(NSObject, "ZigObjcOpaqueZigPtrBridge").?;
+    defer objc.disposeClassPair(Bridge);
+
+    const Impls = struct {
+        fn bumpAppContext(_: objc.Object, _: objc.Sel, maybe_ctx: ?*AppContext, amount: usize) callconv(.c) ?*AppContext {
+            if (maybe_ctx) |ctx| {
+                ctx.counter += amount;
+                return ctx;
+            }
+            return null;
+        }
+
+        fn invokeBlockContext(_: objc.Object, _: objc.Sel, blk_ctx: *WeakActionBlock.Context) callconv(.c) usize {
+            return WeakActionBlock.invoke(blk_ctx, .{});
+        }
+    };
+
+    try testing.expect(Bridge.addMethod("bumpAppContext:amount:", Impls.bumpAppContext));
+    try testing.expect(Bridge.addMethod("invokeBlockContext:", Impls.invokeBlockContext));
+    objc.registerClassPair(Bridge);
+
+    const inst = objc.allocInit(Bridge).?;
+    defer inst.release();
+
+    var app_ctx: AppContext = .{
+        .tag = "zig-state",
+        .weak_ref = .{},
+        .counter = 10,
+    };
+    app_ctx.weak_ref.init(inst);
+    defer app_ctx.weak_ref.deinit();
+
+    try testing.expect(inst.msgSend(?*AppContext, "bumpAppContext:amount:", .{ @as(?*AppContext, null), @as(usize, 5) }) == null);
+    const out_ctx = inst.msgSend(?*AppContext, "bumpAppContext:amount:", .{ &app_ctx, @as(usize, 32) }).?;
+    try testing.expectEqual(@as(usize, 42), out_ctx.counter);
+    try testing.expectEqualStrings("zig-state", out_ctx.tag);
+
+    var block_ctx = WeakActionBlock.init(
+        .{ .weak_ptr = &app_ctx.weak_ref, .delta = 8 },
+        &(struct {
+            fn invoke(b: *const WeakActionBlock.Context) callconv(.c) usize {
+                const loaded = b.weak_ptr.load() orelse return 0;
+                defer loaded.release();
+                return b.delta + 100;
+            }
+        }).invoke,
+    );
+    try testing.expectEqual(@as(usize, 108), inst.msgSend(usize, "invokeBlockContext:", .{&block_ctx}));
+}

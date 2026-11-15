@@ -422,6 +422,7 @@ fn aapcs64HomogeneousInfo(comptime T: type) ?Aarch64HomogeneousInfo {
             16 => .{ .base = f16, .count = 1 },
             32 => .{ .base = f32, .count = 1 },
             64 => .{ .base = f64, .count = 1 },
+            128 => .{ .base = f128, .count = 1 },
             else => null,
         },
         .vector => if (@sizeOf(T) == 8 or @sizeOf(T) == 16)
@@ -634,12 +635,17 @@ test "AAPCS64 HFA/HVA and usesIndirectReturn classification" {
     const MixedFloat = extern struct { a: f32, b: f64 };
     const PaddedFloat3 = extern struct { a: f32 align(16), b: f32, c: f32 };
     const HfaUnion = extern union { vec: [4]f64, pair: NSPoint };
+    const QuadPair = extern struct { lo: f128, hi: f128 };
+    const QuadFive = extern struct { vals: [5]f128 };
 
     try testing.expect(isAarch64HfaOrHva(NSPoint));
     try testing.expect(isAarch64HfaOrHva(NSRect));
     try testing.expect(isAarch64HfaOrHva(Float3));
     try testing.expect(isAarch64HfaOrHva(HfaUnion));
+    try testing.expect(isAarch64HfaOrHva(QuadPair));
+    try testing.expect(!isAarch64HfaOrHva(QuadFive));
     try testing.expect(!isAarch64HfaOrHva(f64));
+    try testing.expect(!isAarch64HfaOrHva(f128));
     try testing.expect(!isAarch64HfaOrHva(@Vector(4, f32)));
     try testing.expect(!isAarch64HfaOrHva(CGAffineTransform));
     try testing.expect(!isAarch64HfaOrHva(BigInts));
@@ -651,15 +657,18 @@ test "AAPCS64 HFA/HVA and usesIndirectReturn classification" {
     try testing.expect(!usesIndirectReturn(NSPoint));
     try testing.expect(usesIndirectReturn(CGAffineTransform));
     try testing.expect(usesIndirectReturn(BigInts));
+    try testing.expect(usesIndirectReturn(QuadFive));
 
     if (builtin.target.cpu.arch == .aarch64) {
         try testing.expect(!usesIndirectReturn(NSRect));
         try testing.expect(!usesIndirectReturn(HfaUnion));
+        try testing.expect(!usesIndirectReturn(QuadPair));
         try testing.expect(!usesIndirectReturn(@Vector(4, f32)));
         try testing.expect(usesIndirectReturn(@Vector(8, f32)));
     } else if (builtin.target.cpu.arch == .x86_64) {
         try testing.expect(usesIndirectReturn(NSRect));
         try testing.expect(usesIndirectReturn(HfaUnion));
+        try testing.expect(usesIndirectReturn(QuadPair));
         try testing.expect(!usesIndirectReturn(@Vector(4, f32)));
         try testing.expect(!usesIndirectReturn(@Vector(8, f32)));
     }
