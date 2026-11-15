@@ -251,6 +251,90 @@ pub fn msgSendSuperTry(
     return .{ .ok = val };
 }
 
+/// Sends a C-variadic Objective-C message inside `@try / @catch`, returning `Error!Return`.
+pub fn msgSendVarargsCatch(
+    target: anytype,
+    comptime Return: type,
+    sel_raw: anytype,
+    fixed_args: anytype,
+    var_args: anytype,
+    caught_out: ?*?objc.Object,
+) Error!Return {
+    const Target = @TypeOf(target);
+    const SelRaw = @TypeOf(sel_raw);
+    const FixedArgs = @TypeOf(fixed_args);
+    const VarArgs = @TypeOf(var_args);
+    const Helper = struct {
+        inline fn call(t: Target, s: SelRaw, fa: FixedArgs, va: VarArgs) Return {
+            return objc.msgSendVarargs(t, Return, s, fa, va);
+        }
+    };
+    return tryInvokeCatch(Helper.call, .{ target, sel_raw, fixed_args, var_args }, caught_out);
+}
+
+/// Sends a C-variadic Objective-C message
+/// (`objc.msgSendVarargs(target, Return, sel_raw, fixed_args, var_args)`) inside
+/// an Objective-C `@try / @catch` frame.
+///
+/// When `.exception` is non-null, it has `+1` retain ownership and the caller
+/// should call `.release()` when finished inspecting it.
+pub fn msgSendVarargsTry(
+    target: anytype,
+    comptime Return: type,
+    sel_raw: anytype,
+    fixed_args: anytype,
+    var_args: anytype,
+) TryResult(Return) {
+    var caught_exc: ?objc.Object = null;
+    const val = msgSendVarargsCatch(target, Return, sel_raw, fixed_args, var_args, &caught_exc) catch {
+        return .{ .exception = caught_exc };
+    };
+    return .{ .ok = val };
+}
+
+/// Sends a C-variadic Objective-C superclass message inside `@try / @catch`, returning `Error!Return`.
+pub fn msgSendSuperVarargsCatch(
+    target: anytype,
+    superclass: objc.Class,
+    comptime Return: type,
+    sel_raw: anytype,
+    fixed_args: anytype,
+    var_args: anytype,
+    caught_out: ?*?objc.Object,
+) Error!Return {
+    const Target = @TypeOf(target);
+    const SelRaw = @TypeOf(sel_raw);
+    const FixedArgs = @TypeOf(fixed_args);
+    const VarArgs = @TypeOf(var_args);
+    const Helper = struct {
+        inline fn call(t: Target, sup: objc.Class, s: SelRaw, fa: FixedArgs, va: VarArgs) Return {
+            return objc.msgSendSuperVarargs(t, sup, Return, s, fa, va);
+        }
+    };
+    return tryInvokeCatch(Helper.call, .{ target, superclass, sel_raw, fixed_args, var_args }, caught_out);
+}
+
+/// Sends a C-variadic Objective-C superclass message
+/// (`objc.msgSendSuperVarargs(target, superclass, Return, sel_raw, fixed_args, var_args)`)
+/// inside an Objective-C `@try / @catch` frame.
+///
+/// When `.exception` is non-null, it has `+1` retain ownership and the caller
+/// should call `.release()` when finished inspecting it.
+pub fn msgSendSuperVarargsTry(
+    target: anytype,
+    superclass: objc.Class,
+    comptime Return: type,
+    sel_raw: anytype,
+    fixed_args: anytype,
+    var_args: anytype,
+) TryResult(Return) {
+    var caught_exc: ?objc.Object = null;
+    const val = msgSendSuperVarargsCatch(target, superclass, Return, sel_raw, fixed_args, var_args, &caught_exc) catch {
+        return .{ .exception = caught_exc };
+    };
+    return .{ .ok = val };
+}
+
 /// Throws an Objective-C runtime exception (`objc_exception_throw` / `@throw`).
 pub fn throw(exception: ?objc.Object) noreturn {
     c.objc_exception_throw(if (exception) |exc| exc.value else null);
@@ -841,6 +925,94 @@ test "non-NSException NSNumber throw, @throw nil, foreign C++ exception, and fas
     const foreign_try = tryInvoke(Helpers.throwForeignInt, .{@as(c_int, 500)});
     try testing.expect(foreign_try.hasThrown());
     try testing.expect(foreign_try.exception == null);
+}
+
+test "msgSendVarargsTry and msgSendSuperVarargsTry handle ok and throwing variadic calls" {
+    const testing = std.testing;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSString = objc.getClassCached("NSString").?;
+    const NSMutableString = objc.getClassCached("NSMutableString").?;
+    const NSPredicate = objc.getClassCached("NSPredicate").?;
+
+    const fmt = NSString.msgSend(objc.Object, objc.S("stringWithUTF8String:"), .{"%s:%d"});
+    switch (NSString.msgSendVarargsTry(objc.Object, objc.S("stringWithFormat:"), .{fmt}, .{ "ok", @as(c_int, 7) })) {
+        .ok => |s| try testing.expectEqualStrings("ok:7", std.mem.span(s.msgSend([*:0]const u8, objc.S("UTF8String"), .{}))),
+        .exception => return error.UnexpectedException,
+    }
+
+    // Throwing class variadic call: malformed NSPredicate format string
+    const bad_pred_fmt = NSString.msgSend(objc.Object, objc.S("stringWithUTF8String:"), .{"INVALID === %%%"});
+    const pred_exc = switch (NSPredicate.msgSendVarargsTry(objc.Object, objc.S("predicateWithFormat:"), .{bad_pred_fmt}, .{@as(c_int, 1)})) {
+        .ok => return error.ExpectedException,
+        .exception => |maybe_exc| maybe_exc orelse return error.ExpectedExceptionObject,
+    };
+    defer pred_exc.release();
+
+    // Throwing variadic call via msgSendVarargsCatch: +[NSException raise:format:]
+    const NSException = objc.getClassCached("NSException").?;
+    const exc_name = NSString.msgSend(objc.Object, objc.S("stringWithUTF8String:"), .{"ZigVarargCatchTest"});
+    const exc_fmt = NSString.msgSend(objc.Object, objc.S("stringWithUTF8String:"), .{"err=%s:%d"});
+    var caught_vararg_exc: ?objc.Object = null;
+    try testing.expectError(
+        error.ExceptionThrown,
+        msgSendVarargsCatch(NSException, void, objc.S("raise:format:"), .{ exc_name, exc_fmt }, .{ "boom", @as(c_int, 17) }, &caught_vararg_exc),
+    );
+    try testing.expect(caught_vararg_exc != null);
+    defer caught_vararg_exc.?.release();
+    try testing.expectEqualStrings(
+        "err=boom:17",
+        std.mem.span(caught_vararg_exc.?.msgSend(objc.Object, objc.S("reason"), .{}).msgSend([*:0]const u8, objc.S("UTF8String"), .{})),
+    );
+
+    // Superclass variadic ok path on instance (`-[NSMutableString appendFormat:]`) and
+    // throwing path on metaclass (`+[NSException raise:format:]`)
+    const CustomMutStr = objc.allocateClassPair(NSMutableString, "ZigObjcExcVarargMutStr").?;
+    defer objc.disposeClassPair(CustomMutStr);
+
+    try testing.expect(CustomMutStr.addMethod("init", struct {
+        fn init(self_obj: objc.Object, _: objc.Sel) callconv(.c) c.id {
+            self_obj.release();
+            return objc.getClassCached("NSMutableString").?.msgSend(objc.Object, objc.S("alloc"), .{}).msgSend(
+                objc.Object,
+                objc.S("initWithUTF8String:"),
+                .{"base"},
+            ).value;
+        }
+    }.init));
+    objc.registerClassPair(CustomMutStr);
+
+    const sub_str = objc.allocInit(CustomMutStr).?;
+    defer sub_str.release();
+
+    const suffix_fmt = NSString.msgSend(objc.Object, objc.S("stringWithUTF8String:"), .{":%d"});
+    switch (sub_str.msgSendSuperVarargsTry(NSMutableString, void, objc.S("appendFormat:"), .{suffix_fmt}, .{@as(c_int, 99)})) {
+        .ok => {},
+        .exception => return error.UnexpectedException,
+    }
+    try testing.expectEqualStrings("base:99", std.mem.span(sub_str.msgSend([*:0]const u8, objc.S("UTF8String"), .{})));
+
+    const SubException = objc.allocateClassPair(NSException, "ZigObjcSubVarargException").?;
+    defer objc.disposeClassPair(SubException);
+    objc.registerClassPair(SubException);
+
+    {
+        // Drain the autoreleased SubException instance before `disposeClassPair(SubException)` runs.
+        var inner_pool = objc.AutoreleasePool.init();
+        defer inner_pool.deinit();
+
+        const exc_meta = objc.getMetaClass("NSException").?;
+        const sup_exc = switch (SubException.msgSendSuperVarargsTry(exc_meta, void, objc.S("raise:format:"), .{ exc_name, exc_fmt }, .{ "super", @as(c_int, 55) })) {
+            .ok => return error.ExpectedException,
+            .exception => |maybe_exc| maybe_exc orelse return error.ExpectedExceptionObject,
+        };
+        defer sup_exc.release();
+        try testing.expectEqualStrings(
+            "err=super:55",
+            std.mem.span(sup_exc.msgSend(objc.Object, objc.S("reason"), .{}).msgSend([*:0]const u8, objc.S("UTF8String"), .{})),
+        );
+    }
 }
 
 test {

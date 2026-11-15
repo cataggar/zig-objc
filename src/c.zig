@@ -514,7 +514,3 @@ test "weakExtern caches resolved and missing runtime symbols" {
     try testing.expect(missing1 == null);
     try testing.expect(missing2 == null);
 }
-
-test {
-    _ = @import("abi.zig");
-}

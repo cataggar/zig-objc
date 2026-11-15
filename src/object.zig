@@ -78,8 +78,12 @@ pub const Object = extern struct {
     const msg_send = MsgSend(Object);
     pub const msgSend = msg_send.msgSend;
     pub const msgSendSuper = msg_send.msgSendSuper;
+    pub const msgSendVarargs = msg_send.msgSendVarargs;
+    pub const msgSendSuperVarargs = msg_send.msgSendSuperVarargs;
     pub const msgSendTry = msg_send.msgSendTry;
     pub const msgSendSuperTry = msg_send.msgSendSuperTry;
+    pub const msgSendVarargsTry = msg_send.msgSendVarargsTry;
+    pub const msgSendSuperVarargsTry = msg_send.msgSendSuperVarargsTry;
 
     /// Convert a raw "id" into an Object. id must fit the size of the
     /// normal C "id" type (i.e. a `usize`).

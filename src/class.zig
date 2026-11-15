@@ -19,8 +19,12 @@ pub const Class = extern struct {
     const msg_send = MsgSend(Class);
     pub const msgSend = msg_send.msgSend;
     pub const msgSendSuper = msg_send.msgSendSuper;
+    pub const msgSendVarargs = msg_send.msgSendVarargs;
+    pub const msgSendSuperVarargs = msg_send.msgSendSuperVarargs;
     pub const msgSendTry = msg_send.msgSendTry;
     pub const msgSendSuperTry = msg_send.msgSendSuperTry;
+    pub const msgSendVarargsTry = msg_send.msgSendVarargsTry;
+    pub const msgSendSuperVarargsTry = msg_send.msgSendSuperVarargsTry;
 
     /// Looks up and caches the permanent/framework `Class` named `name` in a lock-free
     /// `.unordered` atomic static slot per comptime class name (`objc_getClass` runs once

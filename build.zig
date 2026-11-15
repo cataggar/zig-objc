@@ -42,6 +42,37 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run tests");
     const tests_run = b.addRunArtifact(tests);
     test_step.dependOn(&tests_run.step);
+
+    const bench_optimize: std.builtin.Optimize = if (b.user_input_options.contains("optimize") or b.graph.release_mode != .off)
+        optimize
+    else
+        .ReleaseFast;
+    const bench_objc = if (bench_optimize == optimize) objc else blk: {
+        const m = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+        });
+        try configureModule(b, m, objc_c, add_paths);
+        break :blk m;
+    };
+    const bench_root = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .link_libc = true,
+    });
+    bench_root.addImport("objc", bench_objc);
+    if (add_paths) try addAppleSDK(b, bench_root);
+    bench_root.linkFramework("Foundation", .{});
+    const bench_exe = b.addExecutable(.{
+        .name = "objc-bench",
+        .root_module = bench_root,
+    });
+
+    const bench_step = b.step("bench", "Run Objective-C runtime microbenchmarks");
+    const bench_run = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&bench_run.step);
 }
 
 fn configureModule(

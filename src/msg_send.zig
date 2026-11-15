@@ -181,6 +181,31 @@ pub fn MsgSend(comptime T: type) type {
             return exception.msgSendSuperTry(target, superclass, Return, sel_raw, args);
         }
 
+        /// Invoke a C-variadic selector on the target inside an Objective-C
+        /// `@try / @catch` frame, returning `exception.TryResult(Return)`.
+        pub fn msgSendVarargsTry(
+            target: T,
+            comptime Return: type,
+            sel_raw: anytype,
+            fixed_args: anytype,
+            var_args: anytype,
+        ) exception.TryResult(Return) {
+            return exception.msgSendVarargsTry(target, Return, sel_raw, fixed_args, var_args);
+        }
+
+        /// Invoke a C-variadic selector on the superclass inside an Objective-C
+        /// `@try / @catch` frame, returning `exception.TryResult(Return)`.
+        pub fn msgSendSuperVarargsTry(
+            target: T,
+            superclass: objc.Class,
+            comptime Return: type,
+            sel_raw: anytype,
+            fixed_args: anytype,
+            var_args: anytype,
+        ) exception.TryResult(Return) {
+            return exception.msgSendSuperVarargsTry(target, superclass, Return, sel_raw, fixed_args, var_args);
+        }
+
         /// Returns the objc_msgSend or objc_msgSendSuper pointer for the
         /// given C-ABI return type.
         fn msgSendPtr(

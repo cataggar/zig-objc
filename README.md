@@ -8,38 +8,55 @@
 
 | Header / ABI | Highlights |
 | --- | --- |
-| `<objc/runtime.h>` | `Class`, `Object`, `Method`, `Ivar`, `Property`, `Protocol`, dynamic class/protocol registration, typed Zig ivars, method swizzling, associative references, zeroing weak references, `objc_enumerateClasses`, dynamic library image queries, and Swift/runtime hooks |
-| `<objc/message.h>` | Architecture-aware `msgSend` / `msgSendSuper` (`aarch64` & `x86_64` `stret`/`fpret`), `Method.invoke`, `_objc_msgForward` / `_objc_msgForward_stret`, `setForwardHandler` |
-| `<objc/objc.h>` & `<objc/NSObjCRuntime.h>` | `Sel` (`sel_registerName`, `sel_getUid`, `sel_isMapped`, `sel_isEqual`), `NSInteger` / `NSUInteger`, `BOOL` conversion, tagged-pointer-safe `Object` handles |
+| `<objc/runtime.h>` | `Class` (`getClassCached` / `Class.cached`), `Object`, `Method`, `Ivar`, `IvarSlot(T)`, `Property`, `Protocol`, dynamic class/protocol registration, typed `(Object, Sel, ...)` `IMP` callbacks, method swizzling, associative references, zeroing weak references, `objc_enumerateClasses`, dynamic library image queries, and Swift/runtime hooks |
+| `<objc/message.h>` | Architecture-aware `msgSend` / `msgSendSuper` (`aarch64` & `x86_64` `stret`/`fpret`), `msgSendVarargs` / `msgSendSuperVarargs` (C99-promoted variadics), `Method.invoke`, `_objc_msgForward` / `_objc_msgForward_stret`, `setForwardHandler` |
+| `<objc/objc.h>` & `<objc/NSObjCRuntime.h>` | `Sel` (`S` / `selCached` / `Sel.cached`, `sel_registerName`, `sel_getUid`, `sel_isMapped`, `sel_isEqual`), `NSInteger` / `NSUInteger`, `BOOL` conversion, C-ABI `extern struct` `Object` & `Sel` handles with tagged-pointer safety |
 | `<objc/objc-sync.h>` | Recursive `@synchronized` monitors via `obj.synchronize()`, `SyncGuard`, `syncEnter` / `syncExit` |
-| `<objc/objc-exception.h>` | Real Objective-C `@try / @catch` via `obj.msgSendTry`, `msgSendSuperTry`, `tryInvoke`, `tryCall`, `throw`, `rethrow`, and exception hooks/handlers |
-| `<Block.h>` | Stack (`_NSConcreteStackBlock`) and global (`_NSConcreteGlobalBlock`) `Block` creation, automatic `copy`/`dispose` helpers for captured `Object`s and nested blocks, incoming `BlockRef` invocation, and `imp_implementationWithBlock` |
+| `<objc/objc-exception.h>` | Real Objective-C `@try / @catch` (including foreign/C++ exceptions) via `obj.msgSendTry`, `msgSendSuperTry`, `msgSendVarargsTry`, `msgSendSuperVarargsTry`, `tryInvoke`, `tryCall`, `throw`, `rethrow`, and exception hooks/handlers |
+| `<Block.h>` | Stack (`_NSConcreteStackBlock`) and global (`_NSConcreteGlobalBlock`) `Block` creation, automatic `copy`/`dispose` helpers for captured `Object`s and nested blocks, incoming `BlockRef` / `?BlockRef` invocation, and `imp_implementationWithBlock` |
 | Clang ARC & `@autoreleasepool` ABI | `AutoreleasePool`, `alloc` / `allocInit`, `retain` / `release` / `autorelease`, `storeStrong`, return-value handoff helpers, and `objc_initWeak` / `objc_loadWeakRetained` / `objc_destroyWeak` (`objc.Weak`) |
 | Type Encodings | Compile-time `@encode` generation (`Encoding`, `comptimeEncode`) and full runtime type/method signature parsing (`parseType`, `MethodTypeIterator`, `Qualifiers`) |
 
 ## Examples
 
-### Messaging & Nullable Returns (`msgSend`, `msgSendSuper`)
+### Messaging, Cached Selectors/Classes, and Variadic Calls (`msgSend`, `S`, `msgSendVarargs`)
 
 ```zig
+const std = @import("std");
 const objc = @import("objc");
 
 pub fn macosVersionAtLeast(major: i64, minor: i64, patch: i64) bool {
-    const NSProcessInfo = objc.getClass("NSProcessInfo").?;
-    const info = NSProcessInfo.msgSend(objc.Object, "processInfo", .{});
+    // `getClassCached` and `S` (`selCached`) resolve once into lock-free atomic static slots.
+    const NSProcessInfo = objc.getClassCached("NSProcessInfo").?;
+    const info = NSProcessInfo.msgSend(objc.Object, objc.S("processInfo"), .{});
 
-    return info.msgSend(bool, "isOperatingSystemAtLeastVersion:", .{
+    return info.msgSend(bool, objc.S("isOperatingSystemAtLeastVersion:"), .{
         NSOperatingSystemVersion{ .major = major, .minor = minor, .patch = patch },
     });
 }
 
 /// Nullable Objective-C returns map directly to `?objc.Object` (`nil` -> `null`).
 pub fn lookupString(dict: objc.Object, key: objc.Object) ?[:0]const u8 {
-    const value = dict.msgSend(?objc.Object, "objectForKey:", .{key}) orelse return null;
-    return std.mem.span(value.msgSend([*:0]const u8, "UTF8String", .{}));
+    const value = dict.msgSend(?objc.Object, objc.S("objectForKey:"), .{key}) orelse return null;
+    return std.mem.span(value.msgSend([*:0]const u8, objc.S("UTF8String"), .{}));
 }
 
-const std = @import("std");
+/// C-variadic Objective-C methods split fixed parameters from `...` variadic arguments
+/// (automatically applying C99 promotions and Apple Silicon stack vararg layout).
+pub fn formatAndCollect() objc.Object {
+    const NSString = objc.getClassCached("NSString").?;
+    const NSArray = objc.getClassCached("NSArray").?;
+
+    const fmt = NSString.msgSend(objc.Object, objc.S("stringWithUTF8String:"), .{"%s=%d (%.1f)"});
+    const item = NSString.msgSendVarargs(
+        objc.Object,
+        objc.S("stringWithFormat:"),
+        .{fmt},
+        .{ "count", @as(c_int, 42), @as(f32, 3.5) },
+    );
+    return NSArray.msgSendVarargs(objc.Object, objc.S("arrayWithObjects:"), .{item}, .{null});
+}
+
 const NSOperatingSystemVersion = extern struct {
     major: i64,
     minor: i64,
@@ -47,7 +64,7 @@ const NSOperatingSystemVersion = extern struct {
 };
 ```
 
-### Dynamic Subclassing, Typed Zig Ivars, and Protocol Conformance
+### Dynamic Subclassing, `IvarSlot(T)`, and Typed `(Object, Sel)` `IMP`s
 
 ```zig
 const objc = @import("objc");
@@ -56,31 +73,34 @@ const CounterState = struct {
     count: usize = 0,
 };
 
+var state_slot: objc.IvarSlot(*CounterState) = .{};
+
 pub fn makeCounterSubclass() !objc.Class {
-    const NSObject = objc.getClass("NSObject").?;
+    const NSObject = objc.getClassCached("NSObject").?;
     const cls = objc.allocateClassPair(NSObject, "ZigCounterObject") orelse return error.ClassExists;
 
     // Conform to an Objective-C protocol and store a native Zig pointer ivar.
     _ = cls.addProtocol(objc.getProtocol("NSObject").?);
     _ = cls.addIvar(*CounterState, "zig_state");
 
+    // `Object` and `Sel` are ABI-identical `extern struct`s and work directly in `callconv(.c)` IMPs.
     _ = cls.addMethod("incrementBy:", struct {
-        fn imp(target: objc.c.id, _: objc.c.SEL, delta: usize) callconv(.c) usize {
-            const self_obj = objc.Object.fromId(target);
-            const state = self_obj.getTypedIvar(*CounterState, "zig_state").?;
+        fn imp(self: objc.Object, _: objc.Sel, delta: usize) callconv(.c) usize {
+            const state = state_slot.load(self);
             state.count += delta;
             return state.count;
         }
     }.imp);
 
     _ = cls.replaceMethod("dealloc", struct {
-        fn imp(target: objc.c.id, _: objc.c.SEL) callconv(.c) void {
-            const self_obj = objc.Object.fromId(target);
-            self_obj.msgSendSuper(objc.getClass("NSObject").?, void, "dealloc", .{});
+        fn imp(self: objc.Object, _: objc.Sel) callconv(.c) void {
+            self.msgSendSuper(objc.getClassCached("NSObject").?, void, objc.S("dealloc"), .{});
         }
     }.imp);
 
     objc.registerClassPair(cls);
+    // Resolve the ivar byte offset once for sub-nanosecond `load` / `store` (or use lazy `.get` / `.set`).
+    state_slot = objc.IvarSlot(*CounterState).fromClass(cls, "zig_state").?;
     return cls;
 }
 
@@ -89,8 +109,8 @@ pub fn useCounter(cls: objc.Class) void {
     const obj = objc.allocInit(cls).?;
     defer obj.release();
 
-    _ = obj.setTypedIvar(*CounterState, "zig_state", &state);
-    _ = obj.msgSend(usize, "incrementBy:", .{@as(usize, 5)});
+    state_slot.store(obj, &state);
+    _ = obj.msgSend(usize, objc.S("incrementBy:"), .{@as(usize, 5)});
 }
 ```
 
@@ -248,6 +268,13 @@ pub fn build(b: *std.Build) !void {
 - **Zig 0.17.1** (macOS 15+ with Xcode for native `zig build test`).
 - C header translation uses the pinned `translate-c` 2.0.0 package in `build.zig.zon`, translating the Apple SDK headers directly while patching the single block-declarator signature in `<objc/runtime.h>`.
 
+## Testing & Benchmarks
+
+```sh
+zig build test           # Run the full Objective-C runtime test suite
+zig build bench          # Run the ReleaseFast microbenchmark suite (src/bench.zig)
+```
+
 ## Documentation
 
-Read `src/main.zig` and the domain modules under `src/` (`object.zig`, `class.zig`, `msg_send.zig`, `block.zig`, `weak.zig`, `exception.zig`, `sync.zig`, `image.zig`, `encoding.zig`, `method.zig`, `ivar.zig`, `property.zig`, `protocol.zig`, `sel.zig`, `autorelease.zig`, `iterator.zig`); all public types and memory-ownership contracts (`objc.free`, `+1` retained returns, `AutoreleasePool`, `Weak`) are documented inline.
+Read `src/main.zig` and the domain modules under `src/` (`object.zig`, `class.zig`, `msg_send.zig`, `abi.zig`, `block.zig`, `weak.zig`, `exception.zig`, `sync.zig`, `image.zig`, `encoding.zig`, `method.zig`, `ivar.zig`, `property.zig`, `protocol.zig`, `sel.zig`, `autorelease.zig`, `iterator.zig`); all public types and memory-ownership contracts (`objc.free`, `+1` retained returns, `AutoreleasePool`, `Weak`, `IvarSlot`) are documented inline.
